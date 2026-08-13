@@ -1,0 +1,36 @@
+{
+    "manifest_version": 3,
+    "name": "Smart LUFS Normalizer Pro",
+    "version": "4.1",
+    "description": "Chuẩn hóa âm lượng YouTube theo LUFS (BS.1770 2 kênh) với AGC hiệu chuẩn vòng kín, crossover Linkwitz-Riley, auto-makeup và brickwall limiter look-ahead.",
+    "permissions": [
+        "storage"
+    ],
+    "host_permissions": [
+        "*://*.youtube.com/*"
+    ],
+    "action": {
+        "default_popup": "popup.html"
+    },
+    "content_scripts": [
+        {
+            "matches": [
+                "*://*.youtube.com/*"
+            ],
+            "js": [
+                "content.js"
+            ],
+            "run_at": "document_end"
+        }
+    ],
+    "web_accessible_resources": [
+        {
+            "resources": [
+                "limiter-worklet.js"
+            ],
+            "matches": [
+                "*://*.youtube.com/*"
+            ]
+        }
+    ]
+}

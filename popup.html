@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="vi">
+
+<head>
+    <meta charset="UTF-8">
+    <style>
+        body {
+            width: 300px;
+            padding: 15px;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+
+        h3 {
+            margin-top: 0;
+            font-size: 16px;
+            color: #ff0000;
+            text-align: center;
+        }
+
+        .control-group {
+            margin-bottom: 14px;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-size: 13px;
+            font-weight: 600;
+            color: #333;
+        }
+
+        input[type="number"],
+        select {
+            width: 100%;
+            padding: 6px;
+            box-sizing: border-box;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            font-family: inherit;
+        }
+
+        button {
+            width: 100%;
+            padding: 10px;
+            background-color: #065fd4;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: bold;
+        }
+
+        button:hover {
+            background-color: #004cbf;
+        }
+
+        /* --- Bypass / A-B --- */
+        #bypassBtn {
+            background-color: #0f9d58;
+            margin-bottom: 12px;
+        }
+
+        #bypassBtn:hover {
+            background-color: #0b8043;
+        }
+
+        #bypassBtn.off {
+            background-color: #5f6368;
+        }
+
+        #bypassBtn.off:hover {
+            background-color: #3c4043;
+        }
+
+        /* --- Bảng đo realtime --- */
+        .meter {
+            background: #f1f3f4;
+            border-radius: 6px;
+            padding: 10px;
+            margin-bottom: 14px;
+            font-size: 12px;
+        }
+
+        .meter-row {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 4px;
+        }
+
+        .meter-row:last-child {
+            margin-bottom: 0;
+        }
+
+        .meter-label {
+            color: #5f6368;
+        }
+
+        .meter-val {
+            font-family: 'Consolas', 'Courier New', monospace;
+            font-weight: bold;
+            color: #202124;
+        }
+
+        .meter-val.in-range {
+            color: #0f9d58;
+        }
+
+        .meter-val.out-range {
+            color: #d93025;
+        }
+
+        .hint {
+            font-size: 11px;
+            color: #80868b;
+            margin-top: 6px;
+            line-height: 1.4;
+        }
+
+        .status {
+            margin-top: 10px;
+            font-size: 12px;
+            color: #0f9d58;
+            display: none;
+            text-align: center;
+            font-weight: bold;
+        }
+    </style>
+</head>
+
+<body>
+    <h3>Tùy chỉnh Vùng An Toàn</h3>
+
+    <button id="bypassBtn" class="off">Đang XỬ LÝ — bấm để nghe gốc</button>
+
+    <div class="meter">
+        <div class="meter-row">
+            <span class="meter-label">Nguồn (input)</span>
+            <span class="meter-val" id="mIn">-- LUFS</span>
+        </div>
+        <div class="meter-row">
+            <span class="meter-label">Bạn đang nghe (output)</span>
+            <span class="meter-val" id="mOut">-- LUFS</span>
+        </div>
+        <div class="meter-row">
+            <span class="meter-label">AGC đang bù</span>
+            <span class="meter-val" id="mGain">-- dB</span>
+        </div>
+        <div class="meter-row">
+            <span class="meter-label">Độ lợi chain (đo được)</span>
+            <span class="meter-val" id="mOffset">-- dB</span>
+        </div>
+        <div class="meter-row">
+            <span class="meter-label" id="mLimitLabel">Limiter</span>
+            <span class="meter-val" id="mLimit">-- dB</span>
+        </div>
+        <div class="hint" id="hint">Mở một video YouTube để bắt đầu đo.</div>
+    </div>
+
+    <div class="control-group">
+        <label for="modeSelect">Chế độ âm thanh:</label>
+        <select id="modeSelect">
+            <option value="movie">Phim ảnh (Giữ nguyên cảm xúc)</option>
+            <option value="music">Âm nhạc (Cân bằng)</option>
+            <option value="podcast">Podcast/Vlog (Rõ giọng nói)</option>
+            <option value="night">Ban đêm (Ép phẳng âm thanh)</option>
+            <option value="custom">Tùy chỉnh (Thủ công)</option>
+        </select>
+    </div>
+
+    <div class="control-group">
+        <label for="minLufs">Mức nhỏ nhất (LUFS):</label>
+        <input type="number" id="minLufs" value="-16.0" step="0.5">
+    </div>
+
+    <div class="control-group">
+        <label for="maxLufs">Mức lớn nhất (LUFS):</label>
+        <input type="number" id="maxLufs" value="-12.0" step="0.5">
+    </div>
+
+    <button id="saveBtn">Lưu &amp; Áp dụng ngay</button>
+    <div id="status" class="status">Đã lưu cấu hình thành công!</div>
+
+    <script src="popup.js"></script>
+</body>
+
+</html>
