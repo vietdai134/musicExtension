@@ -12,7 +12,14 @@ document.addEventListener('DOMContentLoaded', () => {
     const mOffset = document.getElementById('mOffset');
     const mLimit = document.getElementById('mLimit');
     const mLimitLabel = document.getElementById('mLimitLabel');
+    const mVocal = document.getElementById('mVocal');
     const hint = document.getElementById('hint');
+    const vocalRange = document.getElementById('vocalRange');
+    const vocalVal = document.getElementById('vocalVal');
+    const mChain = document.getElementById('mChain');
+    const deviceSelect = document.getElementById('deviceSelect');
+    const intensityRange = document.getElementById('intensityRange');
+    const intensityVal = document.getElementById('intensityVal');
 
     let isBypassed = false;
 
@@ -24,12 +31,34 @@ document.addEventListener('DOMContentLoaded', () => {
     };
 
     // --- Tải cấu hình ---
-    chrome.storage.sync.get(['userTargetMin', 'userTargetMax', 'userMode', 'userBypass'], (data) => {
-        modeSelect.value = data.userMode || 'podcast';
-        if (data.userTargetMin !== undefined) minInput.value = data.userTargetMin;
-        if (data.userTargetMax !== undefined) maxInput.value = data.userTargetMax;
-        isBypassed = !!data.userBypass;
-        renderBypass();
+    chrome.storage.sync.get(
+        ['userTargetMin', 'userTargetMax', 'userMode', 'userBypass', 'userVocal', 'userDevice', 'userIntensity'],
+        (data) => {
+            modeSelect.value = data.userMode || 'podcast';
+            if (data.userTargetMin !== undefined) minInput.value = data.userTargetMin;
+            if (data.userTargetMax !== undefined) maxInput.value = data.userTargetMax;
+            if (data.userVocal !== undefined) vocalRange.value = data.userVocal;
+            if (data.userDevice) deviceSelect.value = data.userDevice;
+            if (data.userIntensity !== undefined) intensityRange.value = data.userIntensity;
+            vocalVal.textContent = `${vocalRange.value}%`;
+            intensityVal.textContent = `${intensityRange.value}%`;
+            isBypassed = !!data.userBypass;
+            renderBypass();
+        });
+
+    // Lưu ngay khi kéo: hiệu chỉnh bằng tai thì phải nghe được thay đổi tức thì.
+    vocalRange.addEventListener('input', () => {
+        vocalVal.textContent = `${vocalRange.value}%`;
+        chrome.storage.sync.set({ userVocal: parseInt(vocalRange.value, 10) });
+    });
+
+    intensityRange.addEventListener('input', () => {
+        intensityVal.textContent = `${intensityRange.value}%`;
+        chrome.storage.sync.set({ userIntensity: parseInt(intensityRange.value, 10) });
+    });
+
+    deviceSelect.addEventListener('change', () => {
+        chrome.storage.sync.set({ userDevice: deviceSelect.value });
     });
 
     // --- Lưu cấu hình ---
@@ -108,6 +137,8 @@ document.addEventListener('DOMContentLoaded', () => {
         mGain.textContent = '-- dB';
         mOffset.textContent = '-- dB';
         mLimit.textContent = '-- dB';
+        mVocal.textContent = '--';
+        mChain.textContent = '--';
         mOut.classList.remove('in-range', 'out-range');
         hint.textContent = message;
     }
@@ -131,13 +162,35 @@ document.addEventListener('DOMContentLoaded', () => {
                 mOffset.textContent = fmt(res.chainOffsetDb, 'dB', 2);
                 mLimit.textContent = fmt(res.limiterDb, 'dB');
                 mLimitLabel.textContent = res.trueLimiter
-                    ? 'Limiter (brickwall 5ms)'
+                    ? 'Limiter (brickwall 8ms)'
                     : 'Limiter (fallback)';
+                mVocal.textContent = (res.vocalAmount === undefined || res.vocalAmount === null)
+                    ? '--'
+                    : `${(res.vocalAmount * 100).toFixed(0)}%` +
+                      (res.vocalRatioDb === null || res.vocalRatioDb === undefined
+                          ? '' : ` (tỉ lệ ${res.vocalRatioDb.toFixed(1)} dB)`);
+                // Liệt kê khối đang thực sự chạy — trả lời trực tiếp câu
+                // "sao nghe không thấy khác gì" bằng dữ kiện thay vì phỏng đoán.
+                const blocks = [];
+                if (res.intensity > 0) {
+                    if (res.hasEnhance) blocks.push('Punch', 'De-harsh');
+                    if (res.phantomOn) blocks.push('Trầm ảo');
+                    if (res.hfOn) blocks.push('Air');
+                    if (res.device === 'headphone') blocks.push('Crossfeed');
+                }
+                mChain.textContent = blocks.length ? blocks.join(' · ') : 'chỉ chuẩn hoá âm lượng';
+
                 paintOut(mOut, res.outLufs);
 
-                hint.textContent = res.bypassed
-                    ? 'Đang BYPASS — số liệu là của tín hiệu gốc. Bấm nút xanh để so sánh.'
-                    : '"Độ lợi chain" là mức khuếch đại cố định do DSP tạo ra, AGC đã tự trừ đi.';
+                if (res.bypassed) {
+                    hint.textContent = 'Đang BYPASS — số liệu là của tín hiệu gốc. Bấm nút xanh để so sánh.';
+                } else if (!res.integrated) {
+                    hint.textContent = 'Đang đo integrated loudness của bài…';
+                } else if (res.locked) {
+                    hint.textContent = 'Đã khoá mức cho bài này — âm lượng sẽ giữ nguyên tới hết bài.';
+                } else {
+                    hint.textContent = 'Đang chuẩn hoá theo LUFS integrated; sẽ khoá mức sau ~30 giây.';
+                }
 
                 // Đồng bộ nếu trạng thái bị đổi từ nơi khác
                 if (res.bypassed !== isBypassed) {

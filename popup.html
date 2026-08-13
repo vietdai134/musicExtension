@@ -39,6 +39,12 @@
             font-family: inherit;
         }
 
+        input[type="range"] {
+            width: 100%;
+            box-sizing: border-box;
+            accent-color: #065fd4;
+        }
+
         button {
             width: 100%;
             padding: 10px;
@@ -153,7 +159,31 @@
             <span class="meter-label" id="mLimitLabel">Limiter</span>
             <span class="meter-val" id="mLimit">-- dB</span>
         </div>
+        <div class="meter-row">
+            <span class="meter-label">Vocal Focus đang áp</span>
+            <span class="meter-val" id="mVocal">--</span>
+        </div>
+        <div class="meter-row">
+            <span class="meter-label">Khối đang chạy</span>
+            <span class="meter-val" id="mChain">--</span>
+        </div>
         <div class="hint" id="hint">Mở một video YouTube để bắt đầu đo.</div>
+    </div>
+
+    <div class="control-group">
+        <label for="deviceSelect">Bạn đang nghe bằng:</label>
+        <select id="deviceSelect">
+            <option value="headphone">Tai nghe (bật crossfeed)</option>
+            <option value="laptop">Loa laptop / điện thoại (bù trầm ảo)</option>
+            <option value="speaker">Loa ngoài / dàn (giữ nguyên dải trầm)</option>
+        </select>
+    </div>
+
+    <div class="control-group">
+        <label for="intensityRange">Cường độ hiệu ứng: <span id="intensityVal">100%</span></label>
+        <input type="range" id="intensityRange" min="0" max="100" step="5" value="100">
+        <div class="hint">Punch, chi tiết, độ rộng, trầm ảo, crossfeed — tất cả
+            theo thanh này. Kéo về 0 là tắt sạch, chỉ còn chuẩn hoá âm lượng.</div>
     </div>
 
     <div class="control-group">
@@ -165,6 +195,13 @@
             <option value="night">Ban đêm (Ép phẳng âm thanh)</option>
             <option value="custom">Tùy chỉnh (Thủ công)</option>
         </select>
+    </div>
+
+    <div class="control-group">
+        <label for="vocalRange">Vocal Focus: <span id="vocalVal">70%</span></label>
+        <input type="range" id="vocalRange" min="0" max="100" step="5" value="70">
+        <div class="hint">Đẩy giọng hát lên khi bị beat phủ. Mức can thiệp tự dò
+            theo từng bài — bản phối đã cân thì gần như không đụng vào.</div>
     </div>
 
     <div class="control-group">
