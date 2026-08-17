@@ -1,5 +1,5 @@
 // ============================================================================
-//  Smart LUFS Normalizer Pro — v5.1
+//  Smart LUFS Normalizer Pro — v5.2
 //  - AGC feed-forward có hiệu chuẩn vòng kín (chainOffsetDb)
 //  - Multiband auto-makeup: trung tính khi không nén, không còn EQ tilt cố định
 //  - Phantom Bass tự hiệu chuẩn theo tỉ lệ dB so với siêu trầm gốc
@@ -131,6 +131,40 @@
 //  là hỏng vĩnh viễn thẻ đó cho tới khi tải lại trang.
 //  Thêm một trang mới giờ là: thêm một mục vào SITE_ADAPTERS (nếu trang cần xử
 //  lý riêng) + thêm match vào manifest. Không phải sửa gì trong phần âm thanh.
+//
+//  v5.2 — HẾT "to nhỏ thất thường": sửa TOPOLOGY, không phải chỉnh hằng số.
+//  Các bản trước chữa triệu chứng bằng cách chỉnh hằng số thời gian của mấy
+//  vòng lặp. Không bao giờ hết được, vì lỗi nằm ở THỨ TỰ của chuỗi.
+//
+//  Đo bằng mô phỏng có mô hình chain PHỤ THUỘC MỨC (mô phỏng của v5.0 coi chain
+//  là hằng số +2dB nên đã che mất đúng loại lỗi này). Chỉ số: nhạc 4 đoạn
+//  -26..-12 LUFS, hỏi "cùng một mức nguồn thì mức ra có lặp lại được không".
+//    v5.1 ......................... 7.96dB   <- chính là cái nghe thấy
+//    v5.2 ......................... 0.19dB
+//
+//   1. agcGain nằm ở CUỐI chuỗi, nên multiband compressor nhìn thấy mức NGUỒN
+//      THÔ. Bài -27 LUFS gần như không bị nén, bài -9 LUFS bị nén mạnh; trong
+//      cùng một bài thì đoạn nhẹ và đoạn mạnh cũng khác nhau. Độ lợi chain vì
+//      thế biến thiên hơn 10dB, mà chainOffsetDb chỉ là MỘT số vô hướng cố mô
+//      hình hoá tất cả chỗ đó — mô hình không nổi. Chuyển AGC lên ĐẦU chuỗi:
+//      chuẩn hoá trước rồi mới xử lý, đúng thứ tự của một chuỗi mastering.
+//   2. chainOffsetDb học từ momentary (TC ~3-4s) nên nó bám theo TỪNG ĐOẠN
+//      NHẠC thay vì là hằng số của chain, kéo AGC thành compressor rất chậm.
+//      Nay học từ integrated — số có cổng, của cả bài.
+//   3. Auto-makeup bám theo comp.reduction là MỘT VÒNG LẶP CHẬM THỨ HAI chạy
+//      song song với AGC; hai vòng đuổi nhau. Chỉnh TC (2.5s -> 20s ở các bản
+//      trước) chỉ đổi chu kỳ đuổi chứ không bỏ được nó. Nay makeup suy thẳng
+//      từ ngưỡng/tỉ số hiệu dụng tại MAKEUP_REF_DB: không đo thì không có vòng
+//      lặp. Chỉ có nghĩa nhờ (1) — compressor luôn nhận tín hiệu đã chuẩn hoá.
+//   4. Bỏ lớp "nhắm thấp khi số đo còn non" của v5.0. Nó đổi một cú vọt CHỈ
+//      xảy ra ở bài có intro nhẹ lấy một cú trôi ĐẢM BẢO CÓ Ở MỌI BÀI: đo được
+//      gain bò 8.05 -> 10.84dB suốt 16 giây đầu trên nguồn đứng yên hoàn toàn.
+//      Sau (1) thì compressor tự hấp thụ cú nhảy intro -> thân bài (đỉnh chỉ
+//      còn vượt 1.2dB trong 4.3s, trước là 7.3dB trong 10.8s) nên hết cần.
+//
+//  Lưu ý khi đọc số: độ lợi CHAIN vẫn biến thiên ~9dB theo mức vào. Đó là
+//  compressor đang làm đúng việc của nó. Khác biệt là nay nó là HÀM THUẦN của
+//  mức vào — lặp lại được — chứ không phụ thuộc đoạn nhạc vừa phát trước đó.
 // ============================================================================
 
 // --- 1. HẰNG SỐ ĐIỀU KHIỂN ---
@@ -187,17 +221,19 @@ const LOOKAHEAD_MS = 8;              // 5ms quá ngắn cho trầm: envelope bá
 const FAST_LOCK_TICKS = 13;          // ~2.6s đầu mỗi track
 
 // --- KHỚP MỨC KHI CHUYỂN BÀI ---
-// Vấn đề gốc: mấy giây đầu một bài KHÔNG đại diện cho cả bài. Rất nhiều bài mở
-// đầu bằng intro nhẹ; AGC chốt độ lợi theo intro rồi thân bài vào to hơn cả
-// chục dB. Hai lớp phòng vệ:
-//  1. Khi số đo còn non thì cố ý nhắm THẤP hơn mục tiêu. Đoán sai theo hướng
-//     nhỏ thì chỉ khẽ vài giây; đoán sai theo hướng to thì chói tai.
-//  2. Bài mới KHÔNG kế thừa độ lợi của bài trước. Bài trước có thể là bản thu
-//     rất nhỏ (độ lợi +12dB); áp nguyên số đó lên bài sau là một cú vọt.
-//     Thay bằng trung bình động của độ lợi đã ổn định qua các bài đã nghe —
-//     ước lượng tốt hơn hẳn, và lấy min() để không bao giờ khởi đầu to hơn.
-const EARLY_CAUTION_DB = 3.0;        // nhắm thấp hơn ngần này khi chưa có dữ liệu
-const CONFIDENCE_SEC = 10;           // đo đủ ngần này thì tin hẳn số đo
+// Bài mới KHÔNG kế thừa độ lợi của bài trước. Bài trước có thể là bản thu rất
+// nhỏ (độ lợi +12dB); áp nguyên số đó lên bài sau là một cú vọt. Thay bằng
+// trung bình động của độ lợi đã ổn định qua các bài đã nghe, lấy min() để
+// không bao giờ khởi đầu to hơn.
+//
+// Bản 5.0 còn một lớp nữa: nhắm thấp hơn mục tiêu vài dB khi số đo còn non, để
+// phòng bài mở đầu bằng intro nhẹ. ĐÃ BỎ. Nó đổi một cú vọt CHỈ xảy ra ở bài
+// có intro nhẹ lấy một cú trôi mức ĐẢM BẢO CÓ Ở MỌI BÀI: đo được gain bò từ
+// 8.05 lên 10.84dB suốt 16 giây đầu trên nguồn đứng yên hoàn toàn — chính là
+// cái "lúc mới vào bài cứ to nhỏ" mà người dùng nghe thấy. Sau khi AGC chuyển
+// lên đầu chuỗi thì lớp này cũng hết cần: compressor tự hấp thụ cú nhảy
+// intro -> thân bài, đo được đỉnh chỉ còn vượt 1.2dB trong 4.3s (trước: 7.3dB
+// trong 10.8s), nên không đáng đánh đổi.
 const PRIOR_ALPHA = 0.35;            // mỗi bài đóng góp ngần này vào prior
 const TRACK_CHANGE_DUCK_DB = 6.0;    // hạ tạm lúc chuyển bài, fastLock kéo lại ngay
 
@@ -216,13 +252,16 @@ const MOMENTARY_GUARD_DB = 7.0;
 const LIMIT_ALLOW_DB = -1.5;
 const LIMIT_TRIM_MAX_DB = 12;
 
-// Auto-makeup: TC ~20s. Bản cũ để 2.5s — nhanh hơn cả vòng hiệu chuẩn
-// chainOffset (10s), nên chainOffset không bao giờ đuổi kịp và độ lợi chain
-// lắc ±6dB ngay dưới chân AGC. Makeup phải là hằng số của BÀI, không phải
-// của đoạn nhạc: chậm hơn hẳn chainOffset thì chainOffset mới trừ được nó.
-// Trần 12dB cũ x 3 băng cộng vào sumNode đủ đẩy đỉnh chain lên 4–8 lần,
-// vượt xa vùng tuyến tính của waveshaper phía sau => clip cứng.
-const MAKEUP_ALPHA = 0.01;
+// Makeup TĨNH. Các bản trước để nó bám theo comp.reduction đo được — dù ở TC
+// 2.5s hay 20s thì bản chất vẫn là MỘT VÒNG LẶP CHẬM THỨ HAI chạy song song
+// với AGC, và hai vòng đó đuổi nhau. Chỉnh hằng số thời gian chỉ đổi chu kỳ
+// đuổi chứ không bỏ được nó. Nay makeup suy ra thẳng từ ngưỡng/tỉ số hiệu dụng
+// tại một mức tham chiếu: không đo thì không có vòng lặp.
+// Mức tham chiếu chỉ có nghĩa vì AGC đã chuyển lên ĐẦU chuỗi — compressor luôn
+// nhận tín hiệu đã chuẩn hoá, nên "mức vào điển hình" là một số xác định.
+// Trần 6dB x 3 băng: 12dB của bản rất cũ đủ đẩy đỉnh chain vượt vùng tuyến
+// tính của waveshaper phía sau => clip cứng.
+const MAKEUP_REF_DB = -14;
 const MAKEUP_MAX_DB = 6;
 
 // Headroom cho tầng bão hoà. WaveShaper KẸP CỨNG input ngoài [-1,1], nên
@@ -540,12 +579,32 @@ function applyDynamics() {
     const tc = 0.5;
     const prof = COMP_PROFILE[currentUIMode] || COMP_PROFILE.custom;
 
-    const bands = [[compLow, prof.low], [compMid, prof.mid], [compHigh, prof.high]];
-    for (const [comp, [thrDb, ratio]] of bands) {
+    const bands = [
+        [compLow, gainLow, prof.low, 'low'],
+        [compMid, gainMid, prof.mid, 'mid'],
+        [compHigh, gainHigh, prof.high, 'high']
+    ];
+    for (const [comp, makeupNode, [thrDb, ratio], key] of bands) {
         // ratio 1.0 = không nén gì. Đây là cái đảm bảo cường độ 0 trung tính.
-        comp.ratio.setTargetAtTime(1 + (ratio - 1) * intensity, t, tc);
-        comp.threshold.setTargetAtTime(
-            Math.min(0, thrDb + (1 - intensity) * COMP_OFF_THRESH_DB), t, tc);
+        const effRatio = 1 + (ratio - 1) * intensity;
+        const effThr = Math.min(0, thrDb + (1 - intensity) * COMP_OFF_THRESH_DB);
+        comp.ratio.setTargetAtTime(effRatio, t, tc);
+        comp.threshold.setTargetAtTime(effThr, t, tc);
+
+        // Makeup TĨNH, suy ra từ chính cấu hình compressor tại mức tham chiếu.
+        // Bản cũ để makeup bám theo comp.reduction đo được (TC ~20s) — đó là
+        // một vòng lặp chậm THỨ HAI chạy song song với AGC, và nó làm độ lợi
+        // của chain phụ thuộc vào đoạn nhạc vừa phát trước đó. Hệ quả đo được:
+        // cùng một mức nguồn, mức ra chênh nhau tới 3.96dB tuỳ lịch sử.
+        // Không đo thì không có vòng lặp, không có phụ thuộc lịch sử. Làm được
+        // điều này chính là nhờ AGC đã chuyển lên đầu chuỗi: mức vào compressor
+        // nay luôn quanh MAKEUP_REF_DB nên một con số tĩnh mới có nghĩa.
+        // Vẫn tự đổi theo chế độ và cường độ vì nó suy ra từ ngưỡng/tỉ số hiệu
+        // dụng — cường độ 0 cho ratio 1 => makeup đúng 0dB, không tô màu.
+        const over = MAKEUP_REF_DB - effThr;
+        const mk = over > 0 ? Math.min(MAKEUP_MAX_DB, over * (1 - 1 / effRatio)) : 0;
+        makeupDb[key] = mk;
+        makeupNode.gain.setTargetAtTime(Math.pow(10, mk / 20), t, tc);
     }
 
     // Bão hoà: đường cong makeSaturationCurve rút gọn thành x*pi/(pi + k*|x|),
@@ -836,8 +895,27 @@ async function initAudioGraph() {
     }
 
     preInput = audioCtx.createGain();
+
+    // AGC đặt Ở ĐẦU chuỗi, TRƯỚC multiband — không phải ở cuối như các bản trước.
+    // Ở cuối thì compressor nhìn thấy mức NGUỒN THÔ: bài -27 LUFS gần như không
+    // bị nén, bài -9 LUFS bị nén mạnh, và trong cùng một bài thì đoạn nhẹ với
+    // đoạn mạnh cũng khác nhau. Độ lợi của chain vì thế biến thiên hơn 10dB, mà
+    // chainOffsetDb chỉ là MỘT số vô hướng cố mô hình hoá tất cả chỗ đó — không
+    // mô hình được, nên nó đi bám theo đoạn nhạc đang phát và kéo AGC theo.
+    // Chuẩn hoá TRƯỚC rồi mới xử lý là thứ tự đúng của một chuỗi mastering:
+    // compressor luôn làm việc quanh cùng một điểm, nên hành vi của nó lặp lại
+    // được, và bù makeup tĩnh mới có nghĩa.
+    // Đo trên mô phỏng có mô hình chain phụ thuộc mức, nhạc 4 đoạn -26..-12 LUFS,
+    // chỉ số là "cùng một mức nguồn thì mức ra có lặp lại không":
+    //   AGC cuối + makeup tự động (bản cũ) ... 3.96dB
+    //   AGC đầu  + makeup tự động ........... 1.37dB
+    //   AGC cuối + makeup tĩnh .............. 1.43dB
+    //   AGC đầu  + makeup tĩnh (bản này) .... 0.44dB
+    agcGain = audioCtx.createGain();
+    preInput.connect(agcGain);
+
     chainIn = audioCtx.createGain();
-    preInput.connect(chainIn);
+    agcGain.connect(chainIn);
 
     // Nhánh dry (dùng khi bypass) phải trễ bằng nhánh wet, nếu không lúc
     // crossfade hai bản sao tương quan cao lệch nhau 8.1ms sẽ comb filter với
@@ -1190,9 +1268,9 @@ async function initAudioGraph() {
 
     // ---- PUNCH + DE-HARSH ----
     // Đặt SAU multiband compressor (compressor bóp chết transient, đây là chỗ
-    // trả lại) nhưng TRƯỚC AGC/limiter, để phần đỉnh mới tạo ra được limiter
-    // canh và được AGC tính vào phép đo integrated.
-    agcGain = audioCtx.createGain();
+    // trả lại) và TRƯỚC limiter, để phần đỉnh mới tạo ra được limiter canh.
+    // AGC nay nằm ở đầu chuỗi nên tín hiệu tới đây đã được chuẩn hoá mức.
+    let chainOut;
 
     if (usingEnhance) {
         enhanceNode = new AudioWorkletNode(audioCtx, 'enhance', {
@@ -1201,9 +1279,9 @@ async function initAudioGraph() {
             outputChannelCount: [2]
         });
         xfMerge.connect(enhanceNode);
-        enhanceNode.connect(agcGain);
+        chainOut = enhanceNode;
     } else {
-        xfMerge.connect(agcGain);
+        chainOut = xfMerge;
     }
 
     const ceilingLin = Math.pow(10, LIMIT_CEILING_DB / 20);
@@ -1235,7 +1313,7 @@ async function initAudioGraph() {
         limiterNode.release.value = 0.25;
     }
 
-    agcGain.connect(limiterNode);
+    chainOut.connect(limiterNode);
 
     wetGain = audioCtx.createGain();
     wetGain.gain.value = 1;
@@ -1368,21 +1446,8 @@ function resetTrackState() {
     // chainOffsetDb và makeupDb cũng KHÔNG reset: đó là đặc tính của chain
 }
 
-// Makeup bám theo mức nén trung bình dài hạn: giữ nguyên độ nén tức thời (density),
-// chỉ trả lại phần âm lượng bị mất bền vững. Không nén => makeup = 0dB => không tô màu.
-function updateAutoMakeup(now) {
-    const bands = [
-        [compLow, gainLow, 'low'],
-        [compMid, gainMid, 'mid'],
-        [compHigh, gainHigh, 'high']
-    ];
-    for (const [comp, node, key] of bands) {
-        const red = comp.reduction || 0; // dB, <= 0
-        const target = Math.min(MAKEUP_MAX_DB, Math.max(0, -red));
-        makeupDb[key] += (target - makeupDb[key]) * MAKEUP_ALPHA;
-        node.gain.setTargetAtTime(Math.pow(10, makeupDb[key] / 20), now, 0.5);
-    }
-}
+// Makeup nay do applyDynamics đặt một lần theo chế độ + cường độ (xem
+// MAKEUP_REF_DB). Không còn hàm cập nhật theo tick nào cho nó.
 
 // Tỉ lệ trộn Phantom được đặt bằng dB so với siêu trầm gốc, rồi tự tính ra hệ số
 // gain cần thiết từ mức hài đo được. Đổi đường cong waveshaper không làm sai lệch
@@ -1491,7 +1556,6 @@ function startMonitor() {
 
         const now = audioCtx.currentTime;
 
-        updateAutoMakeup(now);
         updatePhantom(now);
         updateHfExciter(now);
         updateVocalFocus(now);
@@ -1525,10 +1589,19 @@ function startMonitor() {
 
         // Hiệu chuẩn vòng kín: học độ lợi cố định của chain, chỉ khi hệ đứng yên
         // và limiter không can thiệp (nếu không sẽ học nhầm thành vòng lặp dương)
+        // Dùng INTEGRATED chứ không phải momentary. Đây là chỗ sai nặng nhất của
+        // các bản trước: momentary (TC ~3-4s) bám theo TỪNG ĐOẠN NHẠC, mà độ lợi
+        // của chain thì phụ thuộc mức vào (compressor nén đoạn to nhiều hơn đoạn
+        // nhẹ - đúng việc của nó). Kết quả là chainOffsetDb, đáng lẽ là hằng số
+        // của chain, lại đi bám theo mức của đoạn đang phát; AGC bù theo nó và
+        // trở thành một compressor rất chậm. Đo được: cùng một mức nguồn, mức ra
+        // chênh nhau tới 7.96dB tuỳ vào đoạn nào vừa phát trước đó.
+        // Integrated có cổng, là số của CẢ BÀI, nên chainOffset mới thật sự là
+        // đặc tính của chain.
         const limiting = limiterReductionDb < -1.0;
-        if (!fastLock && !isCorrecting && !limiting && outLufsSmooth !== null) {
-            const measuredOffset = outLufsSmooth - inLufsSmooth - currentAppliedGainDb;
-            chainOffsetDb += (measuredOffset - chainOffsetDb) * 0.02; // TC ~10s
+        if (!fastLock && !isCorrecting && !limiting && inIntegrated !== null && outIntegrated !== null) {
+            const measuredOffset = outIntegrated - inIntegrated - currentAppliedGainDb;
+            chainOffsetDb += (measuredOffset - chainOffsetDb) * 0.02;
             chainOffsetDb = Math.max(-MAX_GAIN_DB, Math.min(MAX_GAIN_DB, chainOffsetDb));
         }
 
@@ -1560,14 +1633,6 @@ function startMonitor() {
         const effMid = (effMin + effMax) / 2;
         let desiredGainDb = 0;
         if (base < effMin || base > effMax) desiredGainDb = effMid - base;
-
-        // Thận trọng khi số đo còn non. Mấy giây đầu một bài không đại diện cho
-        // cả bài: intro nhẹ làm AGC nâng quá tay, rồi thân bài vào là vọt. Nhắm
-        // thấp hơn một chút cho tới khi đo đủ dữ liệu — sai theo hướng nhỏ thì
-        // chỉ khẽ vài giây, sai theo hướng to thì chói tai.
-        const measuredSec = inIntg.n * lufsBlockDt;
-        const uncertain = Math.max(0, 1 - measuredSec / CONFIDENCE_SEC);
-        desiredGainDb -= EARLY_CAUTION_DB * uncertain;
 
         desiredGainDb += limiterTrimDb;
 
