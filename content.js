@@ -1,5 +1,5 @@
 // ============================================================================
-//  Smart LUFS Normalizer Pro — v4.6
+//  Smart LUFS Normalizer Pro — v4.7
 //  - AGC feed-forward có hiệu chuẩn vòng kín (chainOffsetDb)
 //  - Multiband auto-makeup: trung tính khi không nén, không còn EQ tilt cố định
 //  - Phantom Bass tự hiệu chuẩn theo tỉ lệ dB so với siêu trầm gốc
@@ -48,6 +48,20 @@
 //   3. AudioContext để latencyHint mặc định 'interactive' cho buffer 128–256 mẫu,
 //      quá ngặt cho chain ~45 node + 2 worklet per-sample => trượt deadline,
 //      nghe ra tiếng lụp bụp. Sửa: 'playback'.
+//
+//  v4.7 — trả lại quyền kiểm soát độ nén cho người dùng:
+//   1. Nén multiband trước đây đặt cứng MỘT LẦN lúc dựng graph: kéo cường độ về
+//      0% vẫn nén 4:1, và "Đêm" dùng y hệt setting nén như "Nhạc" dù hai chế độ
+//      này yêu cầu ngược nhau. Nay có COMP_PROFILE theo chế độ, và cường độ co
+//      tỉ số về 1.0 (= không nén chút nào, đo được chính xác 1.00 ở mọi dải).
+//   2. compHigh là de-esser 4:1 attack 1ms/release 50ms áp lên TOÀN BỘ dải
+//      >4kHz — cymbal bị ghì rồi nhả trong 50ms, mất đuôi ngân. Việc dò
+//      sibilance đã có deharsh trong worklet lo đúng cách nên hạ về band
+//      compressor bình thường: tỉ số 1.8–3.5, attack 3ms, release 120ms.
+//   3. Bão hoà trước đây luôn bật bất kể cường độ. makeSaturationCurve rút gọn
+//      thành x*pi/(pi + k*|x|), nên k = 0 cho ĐÚNG hàm đồng nhất — chỉ cần co k
+//      theo cường độ là tắt được tuyệt đối, không cần nhánh dry/wet song song
+//      (nhánh song song sẽ comb filter vì WaveShaper oversample 4x có trễ riêng).
 // ============================================================================
 
 // --- 1. HẰNG SỐ ĐIỀU KHIỂN ---
@@ -101,6 +115,33 @@ const MAKEUP_MAX_DB = 6;
 // 0.2 => +14dBFS, đủ chỗ cho makeup + exciter + widener cộng dồn.
 const SAT_DRIVE = 0.2;
 const SAT_CURVE_K = 2.0;             // bù lại độ "màu" bị mất khi hạ drive
+
+// --- NÉN MULTIBAND THEO CHẾ ĐỘ ---
+// Bản 4.6 trở về trước đặt cứng ngưỡng/tỉ số MỘT LẦN lúc dựng graph rồi không
+// bao giờ đổi. Nghĩa là kéo cường độ về 0% vẫn nén 4:1 ở trầm và cao, và
+// "Đêm" với "Nhạc" dùng y hệt setting nén — trong khi đó là hai yêu cầu ngược
+// nhau: nghe đêm cần ghì mạnh cho đoạn nhỏ nghe được, nghe nhạc cần để yên
+// dynamic. Đây là nguồn "phẳng lì, hết sức sống" lớn nhất còn lại của chain,
+// và người dùng không có nút nào chạm tới được.
+//
+// [ngưỡng dB, tỉ số]. Dải cao ĐÃ HẠ hẳn tỉ số: bản cũ để 4:1 @-20dB với
+// attack 1ms/release 50ms, tức là một de-esser áp lên TOÀN BỘ mọi thứ trên
+// 4kHz — cymbal, hi-hat, đàn dây đều bị ghì như tiếng "s". Việc dò sibilance
+// đã có deharsh trong worklet lo bằng ngưỡng TƯƠNG ĐỐI (đúng cách), nên ở đây
+// chỉ cần kiểm soát dải nhẹ nhàng.
+const COMP_PROFILE = {
+    movie:   { low: [-24, 3.0], mid: [-28, 2.5], high: [-18, 2.5] },
+    music:   { low: [-20, 2.0], mid: [-24, 1.8], high: [-14, 1.8] },
+    night:   { low: [-30, 5.0], mid: [-34, 4.5], high: [-24, 3.5] },
+    podcast: { low: [-24, 3.0], mid: [-30, 4.0], high: [-20, 2.5] },
+    custom:  { low: [-24, 2.5], mid: [-28, 2.5], high: [-18, 2.0] }
+};
+
+// Cường độ 0 PHẢI trung tính tuyệt đối, không phải "gần trung tính". Tỉ số 1.0
+// là điều kiện đủ: DynamicsCompressor với ratio 1 không giảm độ lợi chút nào,
+// nên comp.reduction = 0 và auto-makeup cũng tự về 0dB. Nới thêm ngưỡng chỉ để
+// đường chuyển mượt, không phải để đảm bảo trung tính.
+const COMP_OFF_THRESH_DB = 18;
 
 // Phantom Bass: mức hài ảo giác TÍNH BẰNG dB SO VỚI siêu trầm gốc bị cắt.
 // Đây là đại lượng vật lý có nghĩa, không phụ thuộc đường cong waveshaper,
@@ -199,6 +240,7 @@ let isBypassed = false;
 
 let preInput, chainIn, dryGain, wetGain, outBus, agcGain, sumNode;
 let compLow, compMid, compHigh, gainLow, gainMid, gainHigh;
+let tubeSaturator;
 let exciterBass, mudRemoval, exciterAir, widthBoost, phantomGain, phantomGate;
 let vocalDemud, vocalPresence, vocalSideDuck;
 let vocalCenterProbe, vocalCenterBuf, vocalMaskProbe, vocalMaskBuf;
@@ -351,11 +393,42 @@ function applyAudioProfile(mode) {
         phantomGainDb = -40;
     }
 
-    chainOffsetDb = 0; // đổi profile = đổi độ lợi chain, số hiệu chuẩn cũ hết hiệu lực
+    // Đặt luôn độ nén của chế độ này; applyDynamics tự lo phần reset hiệu chuẩn
+    applyDynamics();
+
+    const p = COMP_PROFILE[currentUIMode] || COMP_PROFILE.custom;
+    console.log(`🎛️ DSP Profile: [${String(mode).toUpperCase()}] — reset hiệu chuẩn chain · ` +
+        `nén L/M/H ${p.low[1]}:1 / ${p.mid[1]}:1 / ${p.high[1]}:1 @ ${(intensity * 100).toFixed(0)}%`);
+}
+
+// Nén multiband + bão hoà, cả hai đều phụ thuộc CHẾ ĐỘ lẫn CƯỜNG ĐỘ nên phải
+// tính chung một chỗ. Gọi từ cả applyAudioProfile (đổi mode) lẫn
+// applyDeviceProfile (đổi thiết bị/cường độ).
+function applyDynamics() {
+    if (!isInitialized) return;
+    const t = audioCtx.currentTime;
+    const tc = 0.5;
+    const prof = COMP_PROFILE[currentUIMode] || COMP_PROFILE.custom;
+
+    const bands = [[compLow, prof.low], [compMid, prof.mid], [compHigh, prof.high]];
+    for (const [comp, [thrDb, ratio]] of bands) {
+        // ratio 1.0 = không nén gì. Đây là cái đảm bảo cường độ 0 trung tính.
+        comp.ratio.setTargetAtTime(1 + (ratio - 1) * intensity, t, tc);
+        comp.threshold.setTargetAtTime(
+            Math.min(0, thrDb + (1 - intensity) * COMP_OFF_THRESH_DB), t, tc);
+    }
+
+    // Bão hoà: đường cong makeSaturationCurve rút gọn thành x*pi/(pi + k*|x|),
+    // nên k = 0 cho ĐÚNG BẰNG x — hàm đồng nhất tuyệt đối, không phải xấp xỉ.
+    // Vì vậy chỉ cần co k theo cường độ là tắt được hẳn mà không cần nhánh
+    // dry/wet song song (nhánh song song sẽ comb filter: WaveShaper oversample
+    // 4x có trễ riêng mà nhánh dry không có).
+    if (tubeSaturator) tubeSaturator.curve = makeSaturationCurve(SAT_CURVE_K * intensity);
+
+    chainOffsetDb = 0;   // đổi độ nén = đổi độ lợi chain
     limiterAvgDb = 0;
     limiterTrimDb = 0;
     isCorrecting = true;
-    console.log(`🎛️ DSP Profile: [${String(mode).toUpperCase()}] — reset hiệu chuẩn chain`);
 }
 
 // setTargetAtTime tiệm cận chứ không bao giờ CHẠM đích. Với các tham số mà
@@ -403,12 +476,12 @@ function applyDeviceProfile() {
         rampParam(enhanceNode.parameters.get('deharsh'), d.deharsh * intensity, t, tc);
     }
 
-    // Đổi thiết bị = đổi độ lợi chain => số hiệu chuẩn cũ hết hiệu lực
-    chainOffsetDb = 0;
-    limiterAvgDb = 0;
-    limiterTrimDb = 0;
-    isCorrecting = true;
+    // Cường độ cũng lái độ nén và độ bão hoà, không riêng width/crossfeed/punch.
+    // applyDynamics tự lo phần reset hiệu chuẩn chain.
+    applyDynamics();
+
     console.log(`🎧 Thiết bị: [${String(currentDevice).toUpperCase()}] · cường độ ${(intensity * 100).toFixed(0)}%` +
+        `${intensity <= 0 ? ' · nén và bão hoà TẮT HẲN' : ''}` +
         `${usingEnhance ? '' : ' · KHÔNG có Punch/De-harsh (worklet lỗi)'}`);
 }
 
@@ -636,21 +709,30 @@ async function initAudioGraph() {
     // Băng <250Hz: chu kỳ 60Hz là 16.7ms. Attack 10ms / release 100ms của bản cũ
     // làm gain đổi NGAY TRONG lòng một chu kỳ sóng => điều chế biên độ, nghe ra
     // đúng là tiếng rè ù ở trầm. Hằng số thời gian phải dài hơn chu kỳ thấp nhất.
+    // Ngưỡng/tỉ số do applyDynamics đặt theo chế độ + cường độ (gọi ở cuối hàm
+    // này). Ở đây chỉ đặt hằng số thời gian — thứ phụ thuộc VẬT LÝ của dải tần
+    // chứ không phụ thuộc sở thích người dùng — và khởi tạo ratio 1.0 để nếu
+    // applyDynamics vì lý do gì chưa chạy thì chain vẫn trung tính.
     compLow = audioCtx.createDynamicsCompressor();
-    compLow.threshold.value = -24; compLow.ratio.value = 4.0;
+    compLow.threshold.value = -24; compLow.ratio.value = 1.0;
     compLow.attack.value = 0.03; compLow.release.value = 0.25;
     gainLow = audioCtx.createGain(); gainLow.gain.value = 1.0;
     lowAllpass.connect(compLow); compLow.connect(gainLow);
 
     compMid = audioCtx.createDynamicsCompressor();
-    compMid.threshold.value = -30; compMid.ratio.value = 3.0;
+    compMid.threshold.value = -30; compMid.ratio.value = 1.0;
     compMid.attack.value = 0.005; compMid.release.value = 0.2;
     gainMid = audioCtx.createGain(); gainMid.gain.value = 1.0;
     midLp2.connect(compMid); compMid.connect(gainMid);
 
+    // Attack 1ms / release 50ms của bản cũ là hằng số của một DE-ESSER, mà nó
+    // lại áp lên toàn bộ dải >4kHz: mỗi cú cymbal bị ghì rồi nhả trong 50ms,
+    // nghe ra là cymbal phập phồng và mất đuôi ngân. Việc dò sibilance đã có
+    // deharsh trong worklet lo đúng cách (ngưỡng tương đối, bandpass 2–6kHz),
+    // nên ở đây trả về hằng số của một band compressor bình thường.
     compHigh = audioCtx.createDynamicsCompressor();
-    compHigh.threshold.value = -20; compHigh.ratio.value = 4.0; // de-esser (6.0 quá gắt trên cymbal)
-    compHigh.attack.value = 0.001; compHigh.release.value = 0.05;
+    compHigh.threshold.value = -20; compHigh.ratio.value = 1.0;
+    compHigh.attack.value = 0.003; compHigh.release.value = 0.12;
     gainHigh = audioCtx.createGain(); gainHigh.gain.value = 1.0;
     highHp2.connect(compHigh); compHigh.connect(gainHigh);
 
@@ -772,8 +854,9 @@ async function initAudioGraph() {
     preSatGain.gain.value = SAT_DRIVE;
     exciterAir.connect(preSatGain);
 
-    const tubeSaturator = audioCtx.createWaveShaper();
-    tubeSaturator.curve = makeSaturationCurve(SAT_CURVE_K);
+    // Đường cong do applyDynamics đặt theo cường độ (k = 0 => hàm đồng nhất).
+    tubeSaturator = audioCtx.createWaveShaper();
+    tubeSaturator.curve = makeSaturationCurve(SAT_CURVE_K * intensity);
     tubeSaturator.oversample = '4x';
     preSatGain.connect(tubeSaturator);
 

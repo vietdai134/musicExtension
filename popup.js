@@ -173,6 +173,9 @@ document.addEventListener('DOMContentLoaded', () => {
                 // "sao nghe không thấy khác gì" bằng dữ kiện thay vì phỏng đoán.
                 const blocks = [];
                 if (res.intensity > 0) {
+                    // Nén và bão hoà nay cũng tắt hẳn ở cường độ 0, nên khi
+                    // cường độ > 0 chúng thuộc danh sách "đang thực sự chạy".
+                    blocks.push('Nén', 'Bão hoà');
                     if (res.hasEnhance) blocks.push('Punch', 'De-harsh');
                     if (res.phantomOn) blocks.push('Trầm ảo');
                     if (res.hfOn) blocks.push('Air');
