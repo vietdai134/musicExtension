@@ -1,5 +1,5 @@
 // ============================================================================
-//  Smart LUFS Normalizer Pro — v5.2
+//  Smart LUFS Normalizer Pro — v5.3
 //  - AGC feed-forward có hiệu chuẩn vòng kín (chainOffsetDb)
 //  - Multiband auto-makeup: trung tính khi không nén, không còn EQ tilt cố định
 //  - Phantom Bass tự hiệu chuẩn theo tỉ lệ dB so với siêu trầm gốc
@@ -165,6 +165,27 @@
 //  Lưu ý khi đọc số: độ lợi CHAIN vẫn biến thiên ~9dB theo mức vào. Đó là
 //  compressor đang làm đúng việc của nó. Khác biệt là nay nó là HÀM THUẦN của
 //  mức vào — lặp lại được — chứ không phụ thuộc đoạn nhạc vừa phát trước đó.
+//
+//  v5.3 — "mới vô rất to rồi nhỏ dần": fastLock nhảy cóc LÊN.
+//  Mấy trăm ms tới vài giây đầu một video thường rất khẽ — fade-in, logo, im
+//  lặng trước khi nhạc vào. Chưa có integrated nên AGC lấy momentary của đúng
+//  đoạn khẽ đó làm mức của cả bài, rồi fastLock CHỐT THẲNG độ lợi tính ra —
+//  kịch trần +24dB. Tới khi nhạc thật vào thì đã muộn, và phải mất cả chục
+//  giây bò về. Đo với 3 giây khẽ ở đầu: vọt lên -6.76 LUFS rồi ~10s mới về.
+//  Sửa: fastLock giữ nguyên tính bất đối xứng của phần còn lại — HẠ tức thì
+//  (sai theo hướng to mới hại tai), NÂNG có trần tốc độ. Dò 2/3/4/6 dB/s:
+//    2 dB/s -> vọt 0.82dB, bài khẽ vẫn lên đúng mức sau 0.4s
+//    4 dB/s -> vọt 2.84dB
+//    6 dB/s -> vọt 4.63dB
+//  Chọn 2 dB/s: bảo vệ tốt nhất mà không chậm đi (nhờ prior nên khoảng cách
+//  cần đi thường rất ngắn; chỉ bài ĐẦU TIÊN sau khi cài mới phải đi xa).
+//
+//  Ghi chú về công cụ đo: mô hình chain của các mô phỏng trước cho cả ba băng
+//  nhận CÙNG mức với tín hiệu full-band. Sai — crossover chia phổ nên mỗi băng
+//  nằm thấp hơn mức full-band nhiều, tức là thấp hơn ngưỡng compressor hơn
+//  nhiều. Mô hình sai đánh giá quá cao mức nén và cho ra chiều NGƯỢC LẠI với
+//  thực tế. Nay dùng chung một mô hình có offset và trọng số năng lượng theo
+//  băng, và mọi mô phỏng đều require nó để không lệch nhau.
 // ============================================================================
 
 // --- 1. HẰNG SỐ ĐIỀU KHIỂN ---
@@ -214,6 +235,10 @@ const SLEW_UP_DB_PER_SEC = 1.5;
 const SLEW_DOWN_DB_PER_SEC = 6.0;
 const SLEW_LOCKED_UP_DB_PER_SEC = 0.3;
 const SLEW_LOCKED_DOWN_DB_PER_SEC = 2.0;   // đã khoá vẫn phải thoát nhanh khi đoán sai
+// Tốc độ NÂNG trong giai đoạn bám ban đầu. Nhanh hơn lúc bình thường để bài nhỏ
+// lên mức đúng sớm, nhưng vẫn có trần: một ước lượng sai kiểu +24dB không bao
+// giờ được phép hiện thực hoá ngay lập tức.
+const SLEW_ACQUIRE_UP_DB_PER_SEC = 2.0;
 const DEADBAND_OPEN_LOCKED_DB = 2.0;
 const MAX_GAIN_DB = 24;
 const LIMIT_CEILING_DB = -1.0;
@@ -235,7 +260,7 @@ const FAST_LOCK_TICKS = 13;          // ~2.6s đầu mỗi track
 // intro -> thân bài, đo được đỉnh chỉ còn vượt 1.2dB trong 4.3s (trước: 7.3dB
 // trong 10.8s), nên không đáng đánh đổi.
 const PRIOR_ALPHA = 0.35;            // mỗi bài đóng góp ngần này vào prior
-const TRACK_CHANGE_DUCK_DB = 6.0;    // hạ tạm lúc chuyển bài, fastLock kéo lại ngay
+const TRACK_CHANGE_DUCK_DB = 6.0;    // hạ tạm lúc chuyển bài, bám lại ngay sau đó
 
 // Chốt chặn theo mức TỨC THỜI. Cần nó vì integrated làm đúng việc của nó vẫn
 // gây vọt: bài mở đầu bằng intro nhẹ 4s thì integrated (gồm cả intro) nói bài
@@ -1671,7 +1696,19 @@ function startMonitor() {
         else if (isCorrecting && err < DEADBAND_CLOSE_DB) isCorrecting = false;
 
         if (fastLock) {
-            currentAppliedGainDb = desiredGainDb;
+            // Giai đoạn bám ban đầu vẫn BẤT ĐỐI XỨNG, không nhảy cóc cả hai chiều.
+            // Nhảy cóc lên là nguyên nhân của "mới vô rất to rồi nhỏ dần": mấy
+            // trăm ms đầu một video thường rất khẽ (fade-in, logo, im lặng), AGC
+            // lấy luôn số đó làm mức của cả bài và chốt độ lợi kịch trần +24dB;
+            // tới khi nhạc thật vào thì đã muộn. Đo được: 3 giây khẽ ở đầu làm
+            // mức ra vọt lên -6.76 LUFS rồi mất ~10 giây mới bò về -13.96.
+            // HẠ thì vẫn tức thì — sai theo hướng to mới là thứ hại tai.
+            if (desiredGainDb < currentAppliedGainDb) {
+                currentAppliedGainDb = desiredGainDb;
+            } else {
+                const step = SLEW_ACQUIRE_UP_DB_PER_SEC * (TICK_MS / 1000);
+                currentAppliedGainDb += Math.min(desiredGainDb - currentAppliedGainDb, step);
+            }
             agcGain.gain.setTargetAtTime(Math.pow(10, currentAppliedGainDb / 20), now, 0.15);
         } else if (isCorrecting) {
             // Bất đối xứng: HẠ nhanh, LÊN chậm. Hạ chậm nghĩa là bắt tai chịu
