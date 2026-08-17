@@ -1,5 +1,5 @@
 // ============================================================================
-//  Smart LUFS Normalizer Pro — v4.5
+//  Smart LUFS Normalizer Pro — v4.6
 //  - AGC feed-forward có hiệu chuẩn vòng kín (chainOffsetDb)
 //  - Multiband auto-makeup: trung tính khi không nén, không còn EQ tilt cố định
 //  - Phantom Bass tự hiệu chuẩn theo tỉ lệ dB so với siêu trầm gốc
@@ -34,6 +34,20 @@
 //   4. Nới rộng phụ thuộc tần số + đưa trầm về giữa, thay cho nới đều toàn dải.
 //   5. Crossfeed Bauer cho tai nghe.
 //   6. Cắt siêu trầm cho loa nhỏ, đặt SAU chỗ Phantom Bass trích tín hiệu.
+//
+//  v4.6 — ba lỗi kỹ thuật, sửa xong không đổi "gu" âm thanh, chỉ hết sai:
+//   1. Xếp N biquad Q=0.707 GIỐNG NHAU không ra Butterworth bậc 2N. Bốn tầng
+//      thành -12dB ngay tại f0 và điểm -3dB trôi lên ~1.5x. Hậu quả: HP 130Hz
+//      của Phantom Bass thực chất cắt ở 197Hz, chém mất -12..-4dB đúng dải
+//      130–180Hz nơi hài bậc 2 của bass rơi vào — tức là chém đúng thứ nó sinh
+//      ra để giữ; HP 7.5kHz của HF Exciter thực chất ở ~9.7kHz, vứt gần hết hài
+//      7–10kHz; và dải trích "3.5–6.5kHz" thực chất chỉ còn ~4.3–5.3kHz.
+//      Sửa: chia cực Butterworth, mỗi tầng một Q. Cùng số biquad, cùng CPU.
+//   2. Limiter dò đỉnh trên mẫu rời rạc => đỉnh giữa hai mẫu vượt trần tới ~1dB
+//      và clip ở tầng resample/DAC. Sửa: dò true peak qua nội suy 4x (BS.1770-4).
+//   3. AudioContext để latencyHint mặc định 'interactive' cho buffer 128–256 mẫu,
+//      quá ngặt cho chain ~45 node + 2 worklet per-sample => trượt deadline,
+//      nghe ra tiếng lụp bụp. Sửa: 'playback'.
 // ============================================================================
 
 // --- 1. HẰNG SỐ ĐIỀU KHIỂN ---
@@ -527,7 +541,12 @@ async function initAudioGraph() {
     if (isInitialized || isInitializing) return;
     isInitializing = true;
 
-    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    // latencyHint 'playback': chain này có ~45 node, 2 AudioWorklet chạy từng mẫu
+    // và 4 WaveShaper oversample 4x. Mặc định 'interactive' cho buffer 128–256
+    // mẫu — audio thread trượt deadline lúc YouTube decode nặng và sinh ra tiếng
+    // lụp bụp. Ở đây không có gì cần độ trễ thấp: không tương tác realtime,
+    // AGC/limiter đều là vòng chậm hơn buffer nhiều bậc.
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'playback' });
 
     // Nạp limiter worklet TRƯỚC khi dựng graph, để không phải hot-swap gây click
     try {
@@ -567,6 +586,28 @@ async function initAudioGraph() {
         f.frequency.value = freq;
         f.Q.value = Q_BUTTER;
         return f;
+    };
+
+    // Xếp N biquad GIỐNG HỆT nhau không ra Butterworth bậc 2N. Mỗi tầng Q=0.707
+    // đã -3dB tại f0, nên 4 tầng thành -12dB tại f0 và điểm -3dB thực trôi lên
+    // ~1.5x f0. Butterworth bậc cao phải CHIA CỰC: mỗi tầng một Q riêng. Chỉ khi
+    // đó passband mới phẳng và -3dB mới rơi đúng f0, với cùng số biquad, cùng CPU.
+    // (LR4 của crossover thì ngược lại — hai tầng Q=0.707 là ĐÚNG theo định
+    // nghĩa, vì LR cần -6dB tại điểm cắt để hai nhánh cộng lại phẳng.)
+    const BUTTER_Q = {
+        4: [0.54119610, 1.30656296],
+        6: [0.51763809, 0.70710678, 1.93185165],
+        8: [0.50979558, 0.60134489, 0.89997622, 2.56291545]
+    };
+    const cascade = (src, type, f0, order) => {
+        let node = src;
+        for (const q of BUTTER_Q[order]) {
+            const f = lr(type, f0);
+            f.Q.value = q;
+            node.connect(f);
+            node = f;
+        }
+        return node;
     };
 
     // Cắt siêu trầm cho loa nhỏ. Đặt SAU chỗ Phantom Bass trích tín hiệu (nó
@@ -616,35 +657,31 @@ async function initAudioGraph() {
     // ---- PHANTOM BASS ----
     // Trích xuất 35–90Hz. Chặn rumble dưới 35Hz vì hài của nó rơi xuống dưới 130Hz,
     // sẽ bị bộ lọc phía sau vứt đi — sinh ra chỉ để lãng phí và thêm méo.
-    const phRumble1 = lr('highpass', 35), phRumble2 = lr('highpass', 35);
-    const phExtract1 = lr('lowpass', 90), phExtract2 = lr('lowpass', 90);
-    chainIn.connect(phRumble1); phRumble1.connect(phRumble2);
-    phRumble2.connect(phExtract1); phExtract1.connect(phExtract2);
+    const phRumble = cascade(chainIn, 'highpass', 35, 4);
+    const phBand = cascade(phRumble, 'lowpass', 90, 4);
 
     phantomProbe = audioCtx.createAnalyser();
     phantomProbe.fftSize = 2048;
     phantomProbeBuf = new Float32Array(phantomProbe.fftSize);
-    phExtract2.connect(phantomProbe);
+    phBand.connect(phantomProbe);
 
     // Ghim mức nạp vào waveshaper (điều khiển trong updatePhantom)
     phantomDrive = audioCtx.createGain();
     phantomDrive.gain.value = 1;
-    phExtract2.connect(phantomDrive);
+    phBand.connect(phantomDrive);
 
     const phSaturator = audioCtx.createWaveShaper();
     phSaturator.curve = makePhantomCurve();
     phSaturator.oversample = '4x';
     phantomDrive.connect(phSaturator);
 
-    // HP bậc 8 (48dB/oct) @130Hz. Bản trước dùng 100Hz bậc 4: chỉ triệt 60Hz được
-    // -18.8dB trong khi cho 120Hz qua ở -3.4dB => thứ đi qua chủ yếu là NỀN TẢNG
-    // BỊ RÒ chứ không phải hài. Cấu hình này đẩy khoảng cách đó lên ~40dB.
-    let phHp = phSaturator;
-    for (let i = 0; i < 4; i++) {
-        const f = lr('highpass', 130);
-        phHp.connect(f);
-        phHp = f;
-    }
+    // HP Butterworth bậc 8 (48dB/oct) @130Hz.
+    // Bản 4.5 xếp 4 biquad Q=0.707 giống nhau: -12dB ngay tại 130Hz và -3dB thực
+    // ở tận 197Hz. Hài bậc 2 của bass 65–90Hz rơi đúng vào 130–180Hz nên bị chém
+    // -12 đến -4dB — chính thứ node này sinh ra để giữ. Vòng hiệu chuẩn thấy
+    // harmDb thấp lại đẩy gain bù lên, mà thứ được đẩy chủ yếu là nền tảng rò
+    // qua. Chia cực đúng Butterworth: 130Hz trở lại -3dB, 180Hz gần như phẳng.
+    const phHp = cascade(phSaturator, 'highpass', 130, 8);
 
     // Đo mức hài SAU khi lọc, TRƯỚC gate/gain => tỉ lệ trộn tự hiệu chuẩn được
     phantomOutProbe = audioCtx.createAnalyser();
@@ -664,31 +701,30 @@ async function initAudioGraph() {
     // Soi gương Phantom Bass. Nguồn Opus/AAC bào mòn phần cao tần; không lấy
     // lại được dữ liệu đã mất, nhưng tổng hợp hài từ dải 3.5–6.5kHz còn nguyên
     // vẹn thì tạo lại được cảm giác chi tiết mà tai quy cho dải đó.
-    const hfEx1 = lr('highpass', HF_EXTRACT_LO), hfEx2 = lr('highpass', HF_EXTRACT_LO);
-    const hfEx3 = lr('lowpass', HF_EXTRACT_HI), hfEx4 = lr('lowpass', HF_EXTRACT_HI);
-    chainIn.connect(hfEx1); hfEx1.connect(hfEx2);
-    hfEx2.connect(hfEx3); hfEx3.connect(hfEx4);
+    // Dải trích cũng phải là Butterworth thật: hai biquad Q=0.707 chồng nhau biến
+    // "3.5–6.5kHz" thành ~4.3–5.3kHz, tức là mất hơn nửa lượng chất liệu để tổng hợp hài.
+    const hfHi = cascade(chainIn, 'highpass', HF_EXTRACT_LO, 4);
+    const hfBand = cascade(hfHi, 'lowpass', HF_EXTRACT_HI, 4);
 
     hfProbe = audioCtx.createAnalyser();
     hfProbe.fftSize = 2048;
     hfProbeBuf = new Float32Array(hfProbe.fftSize);
-    hfEx4.connect(hfProbe);
+    hfBand.connect(hfProbe);
 
     hfDrive = audioCtx.createGain();
     hfDrive.gain.value = 1;
-    hfEx4.connect(hfDrive);
+    hfBand.connect(hfDrive);
 
     const hfShaper = audioCtx.createWaveShaper();
     hfShaper.curve = makePhantomCurve();   // hài bậc 2 trội: ngọt hơn bậc 3 ở dải cao
     hfShaper.oversample = '4x';            // hài bậc 3 của 6.5kHz = 19.5kHz, cần chống alias
     hfDrive.connect(hfShaper);
 
-    let hfHp = hfShaper;
-    for (let i = 0; i < 3; i++) {
-        const f = lr('highpass', HF_OUT_HP);
-        hfHp.connect(f);
-        hfHp = f;
-    }
+    // HP Butterworth bậc 6 @7.5kHz. Xếp 3 biquad Q=0.707 (bản 4.5) cho -9dB ngay
+    // tại 7.5kHz và -3dB thực ở ~9.7kHz: hài bậc 2 của nguồn 3.5–5kHz nằm ở
+    // 7–10kHz và bị vứt gần hết, chỉ còn phần trên 12kHz sống sót — đúng vùng
+    // Opus đã cắt sẵn, nên nghe ra "xì" chứ không phải chi tiết.
+    const hfHp = cascade(hfShaper, 'highpass', HF_OUT_HP, 6);
 
     hfOutProbe = audioCtx.createAnalyser();
     hfOutProbe.fftSize = 2048;
