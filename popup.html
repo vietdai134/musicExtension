@@ -134,7 +134,7 @@
 </head>
 
 <body>
-    <h3>Tùy chỉnh Vùng An Toàn</h3>
+    <h3>Chuẩn hoá âm lượng</h3>
 
     <button id="bypassBtn" class="off">Đang XỬ LÝ — bấm để nghe gốc</button>
 
@@ -195,6 +195,8 @@
             <option value="night">Ban đêm (Ép phẳng âm thanh)</option>
             <option value="custom">Tùy chỉnh (Thủ công)</option>
         </select>
+        <div class="hint">Chỉ đổi CÁCH xử lý — độ nén từng dải, trầm ảo, độ rộng.
+            Không đổi âm lượng: mức nghe do thanh bên dưới quyết định.</div>
     </div>
 
     <div class="control-group">
@@ -205,13 +207,12 @@
     </div>
 
     <div class="control-group">
-        <label for="minLufs">Mức nhỏ nhất (LUFS):</label>
-        <input type="number" id="minLufs" value="-16.0" step="0.5">
-    </div>
-
-    <div class="control-group">
-        <label for="maxLufs">Mức lớn nhất (LUFS):</label>
-        <input type="number" id="maxLufs" value="-12.0" step="0.5">
+        <label for="targetRange">Mức bạn muốn nghe: <span id="targetVal">Vừa · -14.0 LUFS</span></label>
+        <input type="range" id="targetRange" min="-24" max="-6" step="0.5" value="-14">
+        <div class="hint">Chỉnh MỘT LẦN rồi thôi: mọi bài — nhỏ quá hay to quá —
+            đều được kéo về đúng mức này. Cách chỉnh: để volume máy ở mức bạn hay
+            dùng, mở một bài bạn thấy vừa tai, rồi kéo thanh này cho tới khi nghe
+            bằng nó. Từ đó về sau mọi bài khác sẽ tự khớp theo.</div>
     </div>
 
     <button id="saveBtn">Lưu &amp; Áp dụng ngay</button>

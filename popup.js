@@ -1,6 +1,6 @@
 document.addEventListener('DOMContentLoaded', () => {
-    const minInput = document.getElementById('minLufs');
-    const maxInput = document.getElementById('maxLufs');
+    const targetRange = document.getElementById('targetRange');
+    const targetVal = document.getElementById('targetVal');
     const modeSelect = document.getElementById('modeSelect');
     const saveBtn = document.getElementById('saveBtn');
     const statusDiv = document.getElementById('status');
@@ -23,20 +23,37 @@ document.addEventListener('DOMContentLoaded', () => {
 
     let isBypassed = false;
 
-    const modes = {
-        movie: { min: -24.0, max: -10.0 },
-        music: { min: -18.0, max: -12.0 },
-        podcast: { min: -16.0, max: -12.0 },
-        night: { min: -24.0, max: -22.0 }
+    // Ở đây từng có bảng preset min/max theo chế độ, và đó là chỗ mà "chế độ âm
+    // thanh" lặng lẽ chỉnh âm lượng: chọn Ban đêm là mục tiêu tụt xuống -23
+    // LUFS, chọn Âm nhạc là -15, Phim là -17. Người dùng chọn cách XỬ LÝ, không
+    // ai nghĩ mình vừa vặn nhỏ volume. Nay hai thứ tách hẳn: chế độ lo hiệu ứng,
+    // thanh mức lo âm lượng.
+
+    // LUFS là đơn vị đúng để hệ đo, nhưng không phải đơn vị người dùng nghĩ
+    // bằng. "Vừa với tai" là câu hỏi họ trả lời được; "-11.5 LUFS" thì không.
+    // Nên hiện chữ trước, số sau — số vẫn giữ để đối chiếu với bảng đo ở trên.
+    const targetWord = (v) => {
+        if (v <= -19) return 'Rất khẽ (nghe nền)';
+        if (v <= -15.5) return 'Khẽ';
+        if (v <= -12) return 'Vừa';
+        if (v <= -9.5) return 'To';
+        return 'Rất to (limiter phải ghì nhiều)';
     };
+
+    const fmtTarget = (v) => `${targetWord(parseFloat(v))} · ${parseFloat(v).toFixed(1)} LUFS`;
 
     // --- Tải cấu hình ---
     chrome.storage.sync.get(
-        ['userTargetMin', 'userTargetMax', 'userMode', 'userBypass', 'userVocal', 'userDevice', 'userIntensity'],
+        ['userTargetLufs', 'userTargetMin', 'userTargetMax', 'userMode', 'userBypass', 'userVocal', 'userDevice', 'userIntensity'],
         (data) => {
             modeSelect.value = data.userMode || 'podcast';
-            if (data.userTargetMin !== undefined) minInput.value = data.userTargetMin;
-            if (data.userTargetMax !== undefined) maxInput.value = data.userTargetMax;
+            // Chuyển tiếp từ bản có cửa sổ: lấy giữa cửa sổ cũ.
+            if (data.userTargetLufs !== undefined) {
+                targetRange.value = data.userTargetLufs;
+            } else if (data.userTargetMin !== undefined && data.userTargetMax !== undefined) {
+                targetRange.value = (parseFloat(data.userTargetMin) + parseFloat(data.userTargetMax)) / 2;
+            }
+            targetVal.textContent = fmtTarget(targetRange.value);
             if (data.userVocal !== undefined) vocalRange.value = data.userVocal;
             if (data.userDevice) deviceSelect.value = data.userDevice;
             if (data.userIntensity !== undefined) intensityRange.value = data.userIntensity;
@@ -61,23 +78,16 @@ document.addEventListener('DOMContentLoaded', () => {
         chrome.storage.sync.set({ userDevice: deviceSelect.value });
     });
 
+    // Kéo tới đâu nghe tới đó, như mọi thanh trượt khác trong popup này.
+    targetRange.addEventListener('input', () => {
+        targetVal.textContent = fmtTarget(targetRange.value);
+        chrome.storage.sync.set({ userTargetLufs: parseFloat(targetRange.value) });
+    });
+
     // --- Lưu cấu hình ---
     const saveSettings = () => {
-        const minVal = parseFloat(minInput.value);
-        const maxVal = parseFloat(maxInput.value);
-
-        if (Number.isNaN(minVal) || Number.isNaN(maxVal)) {
-            alert('Lỗi: Giá trị LUFS không hợp lệ!');
-            return;
-        }
-        if (minVal > maxVal) {
-            alert('Lỗi: Mức nhỏ nhất không được lớn hơn Mức lớn nhất!');
-            return;
-        }
-
         chrome.storage.sync.set({
-            userTargetMin: minVal,
-            userTargetMax: maxVal,
+            userTargetLufs: parseFloat(targetRange.value),
             userMode: modeSelect.value
         }, () => {
             statusDiv.style.display = 'block';
@@ -85,20 +95,10 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     };
 
+    // Đổi chế độ KHÔNG còn đụng tới mức nghe — chỉ lưu chính nó.
     modeSelect.addEventListener('change', () => {
-        const preset = modes[modeSelect.value];
-        if (preset) {
-            minInput.value = preset.min;
-            maxInput.value = preset.max;
-        }
-        // "Tùy chỉnh" trước đây rơi vào nhánh chết: không preset, không lưu.
-        // Giờ luôn lưu để chế độ DSP được áp dụng.
-        saveSettings();
+        chrome.storage.sync.set({ userMode: modeSelect.value });
     });
-
-    const onManualInputChange = () => { modeSelect.value = 'custom'; };
-    minInput.addEventListener('input', onManualInputChange);
-    maxInput.addEventListener('input', onManualInputChange);
 
     saveBtn.addEventListener('click', saveSettings);
 
@@ -122,13 +122,17 @@ document.addEventListener('DOMContentLoaded', () => {
             ? `-- ${unit}`
             : `${v >= 0 && unit === 'dB' ? '+' : ''}${v.toFixed(digits)} ${unit}`;
 
-    function paintOut(el, lufs) {
+    // Dung sai hiển thị, không phải mục tiêu: AGC nhắm đúng một con số, còn
+    // đèn xanh chỉ trả lời "đã tới nơi chưa". 1.5dB khớp với deadband của AGC.
+    const SHOW_TOL_DB = 1.5;
+
+    function paintOut(el, lufs, target) {
         el.classList.remove('in-range', 'out-range');
         if (lufs === null || lufs === undefined) return;
-        const lo = parseFloat(minInput.value);
-        const hi = parseFloat(maxInput.value);
-        if (Number.isNaN(lo) || Number.isNaN(hi)) return;
-        el.classList.add(lufs >= lo && lufs <= hi ? 'in-range' : 'out-range');
+        const t = (target === null || target === undefined)
+            ? parseFloat(targetRange.value) : target;
+        if (Number.isNaN(t)) return;
+        el.classList.add(Math.abs(lufs - t) <= SHOW_TOL_DB ? 'in-range' : 'out-range');
     }
 
     function clearMeters(message) {
@@ -183,7 +187,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 }
                 mChain.textContent = blocks.length ? blocks.join(' · ') : 'chỉ chuẩn hoá âm lượng';
 
-                paintOut(mOut, res.outLufs);
+                paintOut(mOut, res.outLufs, res.targetLufs);
 
                 if (res.bypassed) {
                     hint.textContent = 'Đang BYPASS — số liệu là của tín hiệu gốc. Bấm nút xanh để so sánh.';
