@@ -1,5 +1,5 @@
 // ============================================================================
-//  Smart LUFS Normalizer Pro — v5.0
+//  Smart LUFS Normalizer Pro — v5.1
 //  - AGC feed-forward có hiệu chuẩn vòng kín (chainOffsetDb)
 //  - Multiband auto-makeup: trung tính khi không nén, không còn EQ tilt cố định
 //  - Phantom Bass tự hiệu chuẩn theo tỉ lệ dB so với siêu trầm gốc
@@ -116,6 +116,21 @@
 //      còn non thì cố ý nhắm thấp hơn, cộng một chốt chặn theo mức tức thời
 //      chỉ hạ chứ không nâng. Đo: nhạc verse/chorus chênh 8dB mỗi 8s làm độ
 //      lợi dao động 0.00dB => chốt chặn không biến AGC thành compressor.
+//
+//  v5.1 — gỡ khoá cứng vào YouTube.
+//  App này không phải chỉ để cho YouTube, nên phần phụ thuộc trang được gom hết
+//  vào SITE_ADAPTERS ở mục 10. Mọi thứ khác — đo LUFS, AGC, limiter, chuỗi DSP
+//  — không biết gì về YouTube và không cần biết. Trước đây có 5 chỗ khoá cứng
+//  nằm rải rác: isPlayerPage, getVideoId, getMainVideo, sự kiện
+//  'yt-navigate-finish', và các selector ytd-*/movie_player.
+//  Adapter tổng quát không đoán cấu trúc DOM của trang (mỗi trang một kiểu,
+//  đoán là sai) mà chỉ dựa vào chính các thẻ media: loại thẻ chưa nạp xong,
+//  thẻ câm, và thẻ ngắn hơn 20s (thường là quảng cáo hoặc tiếng thông báo);
+//  trong số còn lại thì ưu tiên thẻ ĐANG PHÁT, rồi tới thẻ hiển thị to nhất.
+//  Dè dặt là bắt buộc: createMediaElementSource không hoàn tác được, gắn nhầm
+//  là hỏng vĩnh viễn thẻ đó cho tới khi tải lại trang.
+//  Thêm một trang mới giờ là: thêm một mục vào SITE_ADAPTERS (nếu trang cần xử
+//  lý riêng) + thêm match vào manifest. Không phải sửa gì trong phần âm thanh.
 // ============================================================================
 
 // --- 1. HẰNG SỐ ĐIỀU KHIỂN ---
@@ -1621,36 +1636,104 @@ function startMonitor() {
 }
 
 // --- 10. THEO DÕI PLAYER CHÍNH ---
-function isPlayerPage() {
-    return location.pathname.startsWith('/watch') || location.pathname.startsWith('/shorts/');
-}
+// Toàn bộ phần phụ thuộc TRANG gói gọn ở đây. Mọi thứ phía trên — đo LUFS,
+// AGC, limiter, chuỗi DSP — không biết gì về YouTube và không cần biết.
+// Thêm một trang mới = thêm một mục vào SITE_ADAPTERS + một dòng match trong
+// manifest; không phải sửa gì trong phần xử lý âm thanh.
+//
+// Lưu ý an toàn chi phối cả thiết kế này: createMediaElementSource KHÔNG hoàn
+// tác được. Gắn nhầm vào một thẻ video preview/quảng cáo là hỏng vĩnh viễn thẻ
+// đó cho tới khi tải lại trang. Nên mọi adapter đều phải chọn dè dặt, và
+// adapter tổng quát càng phải dè dặt hơn vì nó không biết trang trông thế nào.
 
-function getVideoId() {
-    try {
-        const u = new URL(location.href);
-        if (u.pathname.startsWith('/shorts/')) return u.pathname.split('/')[2] || null;
-        return u.searchParams.get('v');
-    } catch (e) {
+const YOUTUBE_ADAPTER = {
+    name: 'YouTube',
+    match: (host) => /(^|\.)(youtube\.com|youtube-nocookie\.com)$/.test(host),
+    navEvents: ['yt-navigate-finish'],
+    isPlayerPage: () =>
+        location.pathname.startsWith('/watch') || location.pathname.startsWith('/shorts/'),
+    trackId: () => {
+        try {
+            const u = new URL(location.href);
+            if (u.pathname.startsWith('/shorts/')) return u.pathname.split('/')[2] || null;
+            return u.searchParams.get('v');
+        } catch (e) {
+            return null;
+        }
+    },
+    findMedia: () => {
+        const scopes = location.pathname.startsWith('/shorts/')
+            ? ['ytd-reel-video-renderer[is-active]', '#shorts-player', 'ytd-shorts']
+            : ['ytd-player #movie_player', '#movie_player'];
+        for (const sel of scopes) {
+            const host = document.querySelector(sel);
+            if (!host) continue;
+            const v = host.querySelector('video.html5-main-video') || host.querySelector('video');
+            if (v && v.readyState >= 1) return v;
+        }
         return null;
     }
+};
+
+// Adapter tổng quát: dùng cho mọi trang không có adapter riêng. Không đoán cấu
+// trúc DOM của trang (mỗi trang một kiểu, đoán là sai), chỉ dựa vào chính các
+// thẻ media và trạng thái phát của chúng.
+const GENERIC_MIN_DURATION = 20;   // giây; dưới ngưỡng này thường là quảng cáo,
+// tiếng thông báo, video nền tự phát — không phải thứ người dùng đang nghe
+
+const GENERIC_ADAPTER = {
+    name: 'Tổng quát',
+    match: () => true,             // luôn khớp, nên phải để CUỐI danh sách
+    navEvents: [],
+    isPlayerPage: () => true,
+    // Nhiều trang nhạc đổi URL theo từng bài; trang nào không đổi thì vẫn được
+    // 'loadstart' của thẻ media lo, nên không mất gì.
+    trackId: () => {
+        try {
+            const u = new URL(location.href);
+            u.hash = '';
+            return u.href;
+        } catch (e) {
+            return null;
+        }
+    },
+    findMedia: () => {
+        const all = [...document.querySelectorAll('video, audio')].filter((m) => {
+            if (m.readyState < 1) return false;
+            if (!isFinite(m.duration) || m.duration < GENERIC_MIN_DURATION) return false;
+            // Thẻ bị tắt tiếng thì người dùng không nghe nó — gắn vào là vô nghĩa
+            // và có thể là thẻ preview tự phát câm.
+            if (m.muted) return false;
+            return true;
+        });
+        if (all.length === 0) return null;
+
+        // Đang phát là bằng chứng mạnh nhất về "thứ người dùng đang nghe".
+        const playing = all.filter((m) => !m.paused && !m.ended);
+        const pool = playing.length ? playing : all;
+        if (pool.length === 1) return pool[0];
+
+        // Nhiều ứng viên: chọn thẻ hiển thị to nhất; thẻ audio không có kích
+        // thước nên xếp theo thời lượng.
+        const score = (m) => {
+            const r = typeof m.getBoundingClientRect === 'function' ? m.getBoundingClientRect() : null;
+            const area = r ? r.width * r.height : 0;
+            return area > 0 ? area : m.duration;
+        };
+        return pool.reduce((best, m) => (score(m) > score(best) ? m : best));
+    }
+};
+
+const SITE_ADAPTERS = [YOUTUBE_ADAPTER, GENERIC_ADAPTER];
+const site = SITE_ADAPTERS.find((a) => a.match(location.hostname)) || GENERIC_ADAPTER;
+
+function getVideoId() {
+    return site.trackId();
 }
 
-// Chỉ chấp nhận player CHÍNH — createMediaElementSource không hoàn tác được,
-// gắn nhầm video preview ở trang chủ là hỏng vĩnh viễn tab đó.
 function getMainVideo() {
-    if (!isPlayerPage()) return null;
-
-    const scopes = location.pathname.startsWith('/shorts/')
-        ? ['ytd-reel-video-renderer[is-active]', '#shorts-player', 'ytd-shorts']
-        : ['ytd-player #movie_player', '#movie_player'];
-
-    for (const sel of scopes) {
-        const host = document.querySelector(sel);
-        if (!host) continue;
-        const v = host.querySelector('video.html5-main-video') || host.querySelector('video');
-        if (v && v.readyState >= 1) return v;
-    }
-    return null;
+    if (!site.isPlayerPage()) return null;
+    return site.findMedia();
 }
 
 function syncWithPage() {
@@ -1692,7 +1775,9 @@ function startWatcher() {
     syncWithPage();
 }
 
-document.addEventListener('yt-navigate-finish', syncWithPage);
+// Sự kiện điều hướng riêng của từng trang (SPA đổi bài mà không tải lại).
+// Trang không có thì thôi — 'loadstart' của thẻ media và watcher vẫn bắt được.
+for (const ev of site.navEvents) document.addEventListener(ev, syncWithPage);
 window.addEventListener('pageshow', startWatcher); // khôi phục sau bfcache
 
 window.addEventListener('pagehide', () => {
