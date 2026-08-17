@@ -1,5 +1,5 @@
 // ============================================================================
-//  Smart LUFS Normalizer Pro — v4.7
+//  Smart LUFS Normalizer Pro — v4.8
 //  - AGC feed-forward có hiệu chuẩn vòng kín (chainOffsetDb)
 //  - Multiband auto-makeup: trung tính khi không nén, không còn EQ tilt cố định
 //  - Phantom Bass tự hiệu chuẩn theo tỉ lệ dB so với siêu trầm gốc
@@ -62,11 +62,27 @@
 //      thành x*pi/(pi + k*|x|), nên k = 0 cho ĐÚNG hàm đồng nhất — chỉ cần co k
 //      theo cường độ là tắt được tuyệt đối, không cần nhánh dry/wet song song
 //      (nhánh song song sẽ comb filter vì WaveShaper oversample 4x có trễ riêng).
+//
+//  v4.8 — đưa phép đo loudness xuống audio thread:
+//   1. AnalyserNode chỉ đưa ra cửa sổ MỚI NHẤT tại thời điểm gọi, nên timer
+//      jitter trên main thread làm các block đo chồng lấn không đều — trong khi
+//      bộ tích phân có cổng coi mọi block là mẫu thống kê ngang quyền. Sai số
+//      đó rơi thẳng vào số LUFS mà AGC lái theo. Nay loudness-worklet.js tích
+//      luỹ năng lượng trên audio thread, không mất mẫu nào.
+//   2. Block nay đúng BS.1770-4: cửa sổ 400ms chồng lấn 75% (bản cũ 341ms mỗi
+//      200ms = chồng ~41%, trong khi ngưỡng cổng tương đối -10 LU được hiệu
+//      chuẩn cho 75%). Chồng lấn 75% của cửa sổ 400ms chính là bốn đoạn 100ms
+//      liền nhau, nên chỉ cần giữ bốn tổng năng lượng — O(1) bộ nhớ.
+//   3. Các hằng số thời gian nay suy ra TỪ nhịp block (lufsBlockDt) chứ không
+//      đếm block, nên đổi nhịp 200ms -> 100ms không âm thầm đổi ý nghĩa của
+//      chúng. LUFS_TC_* tái lập chính xác alpha đã hiệu chỉnh của bản 200ms.
+//   4. Giữ nhánh dự phòng AnalyserNode: hai worklet kia hỏng thì bỏ tính năng
+//      được, còn bộ đo hỏng thì AGC chết hẳn.
 // ============================================================================
 
 // --- 1. HẰNG SỐ ĐIỀU KHIỂN ---
 const TICK_MS = 200;
-const FFT_SIZE = 16384;              // ~341ms @48kHz — phủ trọn khoảng cách 2 lần đo
+const FFT_SIZE = 16384;              // chỉ dùng cho nhánh dự phòng AnalyserNode (~341ms @48kHz)
 const ABS_GATE_LUFS = -55;
 const DEADBAND_OPEN_DB = 1.0;
 const DEADBAND_CLOSE_DB = 0.15;
@@ -77,17 +93,31 @@ const SLEW_DB_PER_SEC = 1.5;
 // nhạc chênh ±10dB giữa đoạn nhẹ và điệp khúc; bám theo nó với TC ~4s thì AGC
 // biến thành một compressor rất chậm — nghe ra đúng là "nhỏ to thất thường".
 // Integrated đo cả bài, có cổng, cho MỘT con số ổn định để khoá vào.
-const INTEG_MAX_BLOCKS = 4500;       // ring ~15 phút; dài hơn thì lịch sử cũ đóng băng AGC
-const INTEG_MIN_BLOCKS = 8;          // ~1.6s mới đủ tin cậy
+const INTEG_MAX_BLOCKS = 9000;       // ring ~15 phút @100ms; dài hơn thì lịch sử cũ đóng băng AGC
+const INTEG_MIN_SEC = 1.6;           // đo đủ ngần này mới đủ tin cậy
 const REL_GATE_LIN = Math.pow(10, -10 / 10);  // cổng tương đối -10 LU
+
+// Nhịp giữa hai block loudness. Worklet phát mỗi 100ms (BS.1770-4: cửa sổ
+// 400ms chồng lấn 75%); nhánh dự phòng bằng AnalyserNode chạy theo tick 200ms.
+// Mọi hằng số thời gian bên dưới suy ra TỪ giá trị này chứ không phải đếm
+// block, để đổi nhịp không âm thầm đổi luôn ý nghĩa của chúng.
+let lufsBlockDt = 0.1;
+
+// Hằng số thời gian làm mượt momentary, tính bằng GIÂY. Các số này giữ đúng
+// hành vi đã hiệu chỉnh của bản 200ms (alpha 0.35 / 0.07 / 0.05 / 0.06).
+const LUFS_TC_FAST = 0.4642;         // trong FAST_LOCK, bám nhanh cho kịp đầu bài
+const LUFS_TC_UP = 2.7559;           // mức đang tăng
+const LUFS_TC_DOWN = 3.8993;         // mức đang giảm
+const LUFS_TC_OUT = 3.2323;          // đường ra
+const alphaFor = (tcSec) => 1 - Math.exp(-lufsBlockDt / tcSec);
 
 // Khoá dần: biến AGC từ "compressor chậm" thành "normalizer mỗi bài một lần".
 // Điều kiện khoá là SỐ ĐO ĐÃ ĐỨNG YÊN, không phải đã trôi qua bao nhiêu giây.
 // Bài mở đầu bằng intro nhẹ thì ở mốc 30s integrated còn lệch ~6dB so với giá
 // trị thật; khoá theo đồng hồ là khoá đúng vào lúc số đo còn sai.
 // Cách này cũng tự MỞ KHOÁ nếu nội dung đổi thật (video tổng hợp nhiều bài).
-const LOCK_BLOCKS = 150;             // ~30s: điều kiện cần
-const LOCK_CHECK_TICKS = 50;         // đối chiếu mỗi 10s
+const LOCK_SECONDS = 30;             // điều kiện cần (tính bằng dữ liệu đã đo, không phải đồng hồ)
+const LOCK_CHECK_TICKS = 50;         // đối chiếu mỗi 10s (tick điều khiển vẫn 200ms)
 const LOCK_STABLE_DB = 0.5;          // trôi dưới ngần này trong 10s = đã đứng yên
 const SLEW_LOCKED_DB_PER_SEC = 0.3;
 const DEADBAND_OPEN_LOCKED_DB = 2.0;
@@ -252,7 +282,8 @@ let subCut1, subCut2, sideMono, widthExtra, xfGainL, xfGainR;
 let enhanceNode = null;
 let usingEnhance = false;
 let hfGainDb = -40, hfDriveDb = 0, hfOpen = false;
-let inMeter, outMeter;
+let inMeter, outMeter, silentSink;
+let usingLoudnessWorklet = false;
 
 let limiterNode = null;              // AudioWorkletNode hoặc DynamicsCompressor
 let usingWorkletLimiter = false;
@@ -333,7 +364,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             inLufs: inIntegrated !== null ? inIntegrated : inLufsSmooth,
             outLufs: outIntegrated !== null ? outIntegrated : outLufsSmooth,
             integrated: inIntegrated !== null,
-            locked: inIntg !== null && inIntg.n >= LOCK_BLOCKS && integStable,
+            locked: inIntg !== null && inIntg.n * lufsBlockDt >= LOCK_SECONDS && integStable,
             gainDb: currentAppliedGainDb,
             chainOffsetDb: chainOffsetDb,
             limiterDb: limiterReductionDb,
@@ -516,7 +547,9 @@ function makePhantomCurve(n = 8192) {
 }
 
 // --- 6. BỘ ĐO LUFS 2 KÊNH (BS.1770) ---
-function createLufsMeter(inputNode) {
+// Lọc K vẫn dựng bằng BiquadFilter ở đây (đúng và rẻ); chỉ phần TÍCH LUỸ
+// NĂNG LƯỢNG mới xuống worklet, vì đó là chỗ duy nhất mà timer jitter gây sai.
+function createLufsMeter(inputNode, onBlock) {
     const stereoForce = audioCtx.createGain();
     stereoForce.channelCount = 2;
     stereoForce.channelCountMode = 'explicit';
@@ -533,18 +566,36 @@ function createLufsMeter(inputNode) {
     hp.frequency.value = 38.13;
     hp.Q.value = 0.5;
 
-    const splitter = audioCtx.createChannelSplitter(2);
-    const aL = audioCtx.createAnalyser(); aL.fftSize = FFT_SIZE;
-    const aR = audioCtx.createAnalyser(); aR.fftSize = FFT_SIZE;
-
     inputNode.connect(stereoForce);
     stereoForce.connect(shelf);
     shelf.connect(hp);
+
+    if (usingLoudnessWorklet) {
+        const node = new AudioWorkletNode(audioCtx, 'loudness', {
+            numberOfInputs: 1,
+            numberOfOutputs: 1,
+            outputChannelCount: [1]
+        });
+        hp.connect(node);
+        // Node không phát ra gì, nhưng vẫn phải nằm trên đường tới destination
+        // thì đồ thị mới chắc chắn kéo nó chạy. silentSink là gain 0.
+        node.connect(silentSink);
+        node.port.onmessage = (e) => {
+            if (e.data && typeof e.data.ms === 'number') onBlock(e.data.ms);
+        };
+        return { worklet: true };
+    }
+
+    // Dự phòng: AudioWorklet không nạp được thì AGC vẫn phải hoạt động, chỉ là
+    // block đo kém đều hơn. Đo trong tick 200ms như bản cũ.
+    const splitter = audioCtx.createChannelSplitter(2);
+    const aL = audioCtx.createAnalyser(); aL.fftSize = FFT_SIZE;
+    const aR = audioCtx.createAnalyser(); aR.fftSize = FFT_SIZE;
     hp.connect(splitter);
     splitter.connect(aL, 0);
     splitter.connect(aR, 1);
 
-    return { aL, aR, bufL: new Float32Array(FFT_SIZE), bufR: new Float32Array(FFT_SIZE) };
+    return { worklet: false, aL, aR, bufL: new Float32Array(FFT_SIZE), bufR: new Float32Array(FFT_SIZE) };
 }
 
 // Trả về mean-square (năng lượng), chưa đổi ra dB — bộ tích phân cần số tuyến
@@ -591,7 +642,7 @@ function pushBlock(g, ms) {
 // Không có bước này thì đoạn intro/outro nhẹ kéo tụt số đo và AGC đẩy cả bài
 // lên quá to.
 function integratedLufs(g) {
-    if (g.n < INTEG_MIN_BLOCKS) return null;
+    if (g.n * lufsBlockDt < INTEG_MIN_SEC) return null;
     const relThresh = (g.sum / g.n) * REL_GATE_LIN;
     let sum = 0, count = 0;
     for (let i = 0; i < g.n; i++) {
@@ -599,6 +650,29 @@ function integratedLufs(g) {
         if (v >= relThresh) { sum += v; count++; }
     }
     return count === 0 ? null : msToLufs(sum / count);
+}
+
+// Nhận MỘT block loudness (400ms, chồng lấn 75%) từ worklet — hoặc từ nhánh
+// dự phòng trong tick. Đây là nơi duy nhất inLufsSmooth/inIntegrated được cập
+// nhật, nên vòng điều khiển chỉ việc đọc số đã sẵn sàng.
+function pushLufsBlock(isInput, ms) {
+    const lufs = blockLufs(ms);
+    if (lufs === null) return;    // cổng tuyệt đối -55 LUFS: khoảng lặng không tính
+
+    const fast = tickCount <= FAST_LOCK_TICKS;
+
+    if (isInput) {
+        const a = fast ? alphaFor(LUFS_TC_FAST)
+            : alphaFor(inLufsSmooth !== null && lufs > inLufsSmooth ? LUFS_TC_UP : LUFS_TC_DOWN);
+        inLufsSmooth = (inLufsSmooth === null) ? lufs : inLufsSmooth + (lufs - inLufsSmooth) * a;
+        pushBlock(inIntg, ms);
+        inIntegrated = integratedLufs(inIntg);
+    } else {
+        const a = fast ? alphaFor(LUFS_TC_FAST) : alphaFor(LUFS_TC_OUT);
+        outLufsSmooth = (outLufsSmooth === null) ? lufs : outLufsSmooth + (lufs - outLufsSmooth) * a;
+        pushBlock(outIntg, ms);
+        outIntegrated = integratedLufs(outIntg);
+    }
 }
 
 function probeRmsDb(analyserNode, buf) {
@@ -638,6 +712,18 @@ async function initAudioGraph() {
     } catch (e) {
         usingEnhance = false;
         console.warn('⚠️ Không nạp được enhance worklet — tắt Punch và De-harsh:', e);
+    }
+
+    // Bộ đo loudness. Khác hai worklet trên, cái này KHÔNG bỏ được: AGC sống
+    // bằng số nó trả về. Không nạp được thì lùi về AnalyserNode + tick 200ms.
+    try {
+        await audioCtx.audioWorklet.addModule(chrome.runtime.getURL('loudness-worklet.js'));
+        usingLoudnessWorklet = true;
+        lufsBlockDt = 0.1;
+    } catch (e) {
+        usingLoudnessWorklet = false;
+        lufsBlockDt = TICK_MS / 1000;
+        console.warn('⚠️ Không nạp được loudness worklet — đo bằng AnalyserNode, block kém đều hơn:', e);
     }
 
     preInput = audioCtx.createGain();
@@ -1030,10 +1116,16 @@ async function initAudioGraph() {
     dryGain.connect(outBus);
     outBus.connect(audioCtx.destination);
 
-    inMeter = createLufsMeter(preInput);
-    outMeter = createLufsMeter(outBus);
+    // Điểm neo im lặng cho các node chỉ đo: gain 0 nối tới destination, đủ để
+    // đồ thị kéo chúng chạy mà không đóng góp một mẫu nào vào đầu ra.
+    silentSink = audioCtx.createGain();
+    silentSink.gain.value = 0;
+    silentSink.connect(audioCtx.destination);
+
     inIntg = createIntegrator();
     outIntg = createIntegrator();
+    inMeter = createLufsMeter(preInput, (ms) => pushLufsBlock(true, ms));
+    outMeter = createLufsMeter(outBus, (ms) => pushLufsBlock(false, ms));
 
     isInitialized = true;
     isInitializing = false;
@@ -1222,30 +1314,17 @@ function startMonitor() {
         if (vol < 0.02) return;
         const volDb = 20 * Math.log10(vol);
 
-        const inMs = measureMeanSquare(inMeter);
-        const outMs = measureMeanSquare(outMeter);
-        const inLufs = blockLufs(inMs);
-        const outLufs = blockLufs(outMs);
-        if (inLufs === null) return; // khoảng lặng: giữ nguyên gain
+        // Nhánh dự phòng: không có worklet thì phải tự lấy mẫu ở đây.
+        // Có worklet thì số đo đã được pushLufsBlock cập nhật sẵn ở nhịp 100ms.
+        if (!usingLoudnessWorklet) {
+            pushLufsBlock(true, measureMeanSquare(inMeter));
+            pushLufsBlock(false, measureMeanSquare(outMeter));
+        }
+
+        if (inLufsSmooth === null) return; // chưa đo được gì (hoặc đang lặng)
 
         tickCount++;
         const fastLock = tickCount <= FAST_LOCK_TICKS;
-
-        // Momentary (làm mượt) chỉ còn dùng cho việc hiệu chuẩn chainOffset —
-        // ở đó ta cần IN và OUT đo CÙNG một thời điểm để lấy tỉ số.
-        const aIn = fastLock ? 0.35 : (inLufs > inLufsSmooth ? 0.07 : 0.05);
-        inLufsSmooth = (inLufsSmooth === null) ? inLufs : inLufsSmooth + (inLufs - inLufsSmooth) * aIn;
-
-        if (outLufs !== null) {
-            const aOut = fastLock ? 0.35 : 0.06;
-            outLufsSmooth = (outLufsSmooth === null) ? outLufs : outLufsSmooth + (outLufs - outLufsSmooth) * aOut;
-        }
-
-        // Integrated là thứ lái AGC.
-        pushBlock(inIntg, inMs);
-        if (outLufs !== null) pushBlock(outIntg, outMs);
-        inIntegrated = integratedLufs(inIntg);
-        outIntegrated = integratedLufs(outIntg);
 
         // Đối chiếu integrated với chính nó 10s trước: trôi ít nghĩa là đã hội tụ.
         if (inIntegrated !== null && tickCount % LOCK_CHECK_TICKS === 0) {
@@ -1288,7 +1367,7 @@ function startMonitor() {
         // Khoá dần: đo được càng nhiều thì con số càng đáng tin, và càng ít lý do
         // để còn ngọ nguậy. Sau ~30s, deadband nới ra 2dB và slew tụt còn 0.3dB/s
         // => mức đứng yên trong suốt phần còn lại của bài.
-        const locked = inIntg.n >= LOCK_BLOCKS && integStable;
+        const locked = inIntg.n * lufsBlockDt >= LOCK_SECONDS && integStable;
         const openDb = locked ? DEADBAND_OPEN_LOCKED_DB : DEADBAND_OPEN_DB;
         const slewDb = locked ? SLEW_LOCKED_DB_PER_SEC : SLEW_DB_PER_SEC;
 
@@ -1310,7 +1389,7 @@ function startMonitor() {
         if (tickCount % 10 === 0) {
             console.log(
                 `[AGC] IN ${inIntegrated === null ? '--' : inIntegrated.toFixed(1)} → OUT ${outIntegrated === null ? '--' : outIntegrated.toFixed(1)} LUFS-I ` +
-                `(${inIntg.n} block${locked ? ', ĐÃ KHOÁ' : ''}) | ` +
+                `(${(inIntg.n * lufsBlockDt).toFixed(0)}s đo${locked ? ', ĐÃ KHOÁ' : ''}) | ` +
                 `Gain ${currentAppliedGainDb >= 0 ? '+' : ''}${currentAppliedGainDb.toFixed(2)}dB | ` +
                 `Offset ${chainOffsetDb >= 0 ? '+' : ''}${chainOffsetDb.toFixed(2)}dB | ` +
                 `Makeup L/M/H ${makeupDb.low.toFixed(1)}/${makeupDb.mid.toFixed(1)}/${makeupDb.high.toFixed(1)}dB | ` +
