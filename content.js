@@ -1,5 +1,5 @@
 // ============================================================================
-//  Smart LUFS Normalizer Pro — v5.4
+//  Smart LUFS Normalizer Pro — v5.5
 //  - AGC feed-forward có hiệu chuẩn vòng kín (chainOffsetDb)
 //  - Multiband auto-makeup: trung tính khi không nén, không còn EQ tilt cố định
 //  - Phantom Bass tự hiệu chuẩn theo tỉ lệ dB so với siêu trầm gốc
@@ -297,6 +297,20 @@ const MAKEUP_MAX_DB = 6;
 // đó chỉ mang ~10% năng lượng nên thực tế gần như không chạm ngưỡng, mà vẫn
 // được bù như thể có.
 const BAND_LEVEL_OFFSET_DB = { low: -3.5, mid: -3.5, high: -10.0 };
+
+// Tốc độ học chainOffsetDb, THÍCH NGHI theo độ lớn sai số.
+// Ở trạng thái ổn định phải chậm hơn hẳn độ dài một đoạn nhạc (TC 40s), vì độ
+// lợi chain phụ thuộc mức vào nên phép đo tức thời luôn dao động theo
+// verse/chorus mà ta chỉ muốn lấy trung bình của cả bài.
+// Nhưng lúc mới bật hoặc mới đổi cấu hình thì chainOffsetDb bắt đầu từ 0 trong
+// khi chain thật có thể tới +12dB; học ở TC 40s thì suốt phút đầu mức ra sai
+// cả chục dB — đúng kiểu "mới vô to rồi nhỏ dần". Nên khi sai số còn lớn thì
+// học nhanh (TC ~7s), sát rồi mới chậm lại. An toàn vì vòng này nay hội tụ
+// (hệ số vòng < 1); với công thức integrated của v5.2 thì học nhanh chỉ làm
+// chạy tuột nhanh hơn.
+const CHAIN_OFFSET_ALPHA = 0.005;        // TC ~40s, bám ổn định
+const CHAIN_OFFSET_ALPHA_FAST = 0.03;    // TC ~7s, lúc còn sai nhiều
+const CHAIN_OFFSET_FAST_THRESH_DB = 3.0;
 
 // Headroom cho tầng bão hoà. WaveShaper KẸP CỨNG input ngoài [-1,1], nên
 // ngưỡng clip = 1/SAT_DRIVE. 0.5 (bản cũ) => clip ngay ở +6dBFS đỉnh chain.
@@ -1623,19 +1637,31 @@ function startMonitor() {
 
         // Hiệu chuẩn vòng kín: học độ lợi cố định của chain, chỉ khi hệ đứng yên
         // và limiter không can thiệp (nếu không sẽ học nhầm thành vòng lặp dương)
-        // Dùng INTEGRATED chứ không phải momentary. Đây là chỗ sai nặng nhất của
-        // các bản trước: momentary (TC ~3-4s) bám theo TỪNG ĐOẠN NHẠC, mà độ lợi
-        // của chain thì phụ thuộc mức vào (compressor nén đoạn to nhiều hơn đoạn
-        // nhẹ - đúng việc của nó). Kết quả là chainOffsetDb, đáng lẽ là hằng số
-        // của chain, lại đi bám theo mức của đoạn đang phát; AGC bù theo nó và
-        // trở thành một compressor rất chậm. Đo được: cùng một mức nguồn, mức ra
-        // chênh nhau tới 7.96dB tuỳ vào đoạn nào vừa phát trước đó.
-        // Integrated có cổng, là số của CẢ BÀI, nên chainOffset mới thật sự là
-        // đặc tính của chain.
+        // Hai vế của phép trừ PHẢI có cùng hằng số thời gian, nếu không vòng này
+        // thành vòng lặp dương.
+        //
+        // v5.2 dùng integrated cho cả IN và OUT. Nghe thì hợp lý, nhưng
+        // outIntegrated là TRUNG BÌNH TÍCH LUỸ CÓ CỔNG của cả bài, nên nó gần
+        // như KHÔNG phản ứng với chính hành động điều khiển của ta: khi AGC hạ
+        // độ lợi, các block mới nhỏ đi và bị CỔNG TƯƠNG ĐỐI -10 LU loại thẳng,
+        // nên outIntegrated đứng nguyên ở mức của đoạn đầu bài. Còn
+        // currentAppliedGainDb trong cùng công thức thì thay đổi tức thì.
+        // Kết quả: hạ độ lợi 1dB => measuredOffset tăng đúng 1dB => chainOffset
+        // tăng => desiredGain giảm tiếp. Hệ số vòng đúng bằng 1, chạy tuột tới
+        // trần. Log thực tế: sau 29 giây Gain -2.13 -> -23.23dB trong khi
+        // Offset +0.00 -> +19.12dB, hai số đi song song từng bước.
+        //
+        // Momentary thì hai vế khớp nhau: hạ độ lợi => outLufsSmooth hạ theo
+        // ngay, nên measuredOffset gần như không đổi. Hệ số vòng còn lại chỉ là
+        // độ dốc nén (<1) nên hội tụ. Đổi lại nó bám theo đoạn nhạc, nên phải
+        // trung bình chậm hẳn — đó mới là cách xử lý đúng, chứ không phải đổi
+        // sang một đại lượng không phản hồi.
         const limiting = limiterReductionDb < -1.0;
-        if (!fastLock && !isCorrecting && !limiting && inIntegrated !== null && outIntegrated !== null) {
-            const measuredOffset = outIntegrated - inIntegrated - currentAppliedGainDb;
-            chainOffsetDb += (measuredOffset - chainOffsetDb) * 0.02;
+        if (!fastLock && !isCorrecting && !limiting && inLufsSmooth !== null && outLufsSmooth !== null) {
+            const measuredOffset = outLufsSmooth - inLufsSmooth - currentAppliedGainDb;
+            const err = Math.abs(measuredOffset - chainOffsetDb);
+            const a = err > CHAIN_OFFSET_FAST_THRESH_DB ? CHAIN_OFFSET_ALPHA_FAST : CHAIN_OFFSET_ALPHA;
+            chainOffsetDb += (measuredOffset - chainOffsetDb) * a;
             chainOffsetDb = Math.max(-MAX_GAIN_DB, Math.min(MAX_GAIN_DB, chainOffsetDb));
         }
 
