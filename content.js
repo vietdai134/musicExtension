@@ -1,5 +1,5 @@
 // ============================================================================
-//  Smart LUFS Normalizer Pro — v5.3
+//  Smart LUFS Normalizer Pro — v5.4
 //  - AGC feed-forward có hiệu chuẩn vòng kín (chainOffsetDb)
 //  - Multiband auto-makeup: trung tính khi không nén, không còn EQ tilt cố định
 //  - Phantom Bass tự hiệu chuẩn theo tỉ lệ dB so với siêu trầm gốc
@@ -288,6 +288,15 @@ const LIMIT_TRIM_MAX_DB = 12;
 // tính của waveshaper phía sau => clip cứng.
 const MAKEUP_REF_DB = -14;
 const MAKEUP_MAX_DB = 6;
+
+// Mức trung bình của TỪNG BĂNG so với mức FULL-BAND, với phổ nhạc điển hình đi
+// qua crossover LR4 tại 250Hz và 4kHz (thấp ~45%, trung ~45%, cao ~10% năng
+// lượng). Bắt buộc phải có con số này: ngưỡng compressor là ngưỡng CỦA BĂNG,
+// còn MAKEUP_REF_DB là mức FULL-BAND. So thẳng hai thứ đó là sai thứ nguyên —
+// nó tưởng băng nào cũng bị nén mạnh nên bù quá tay, nặng nhất ở dải cao: băng
+// đó chỉ mang ~10% năng lượng nên thực tế gần như không chạm ngưỡng, mà vẫn
+// được bù như thể có.
+const BAND_LEVEL_OFFSET_DB = { low: -3.5, mid: -3.5, high: -10.0 };
 
 // Headroom cho tầng bão hoà. WaveShaper KẸP CỨNG input ngoài [-1,1], nên
 // ngưỡng clip = 1/SAT_DRIVE. 0.5 (bản cũ) => clip ngay ở +6dBFS đỉnh chain.
@@ -626,7 +635,7 @@ function applyDynamics() {
         // nay luôn quanh MAKEUP_REF_DB nên một con số tĩnh mới có nghĩa.
         // Vẫn tự đổi theo chế độ và cường độ vì nó suy ra từ ngưỡng/tỉ số hiệu
         // dụng — cường độ 0 cho ratio 1 => makeup đúng 0dB, không tô màu.
-        const over = MAKEUP_REF_DB - effThr;
+        const over = MAKEUP_REF_DB + BAND_LEVEL_OFFSET_DB[key] - effThr;
         const mk = over > 0 ? Math.min(MAKEUP_MAX_DB, over * (1 - 1 / effRatio)) : 0;
         makeupDb[key] = mk;
         makeupNode.gain.setTargetAtTime(Math.pow(10, mk / 20), t, tc);
