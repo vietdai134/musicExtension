@@ -115,6 +115,11 @@ class LookaheadLimiterProcessor extends AudioWorkletProcessor {
 
         this.minGainBlock = 1;
         this.blocks = 0;
+
+        // Báo tổng trễ để main thread bù cho nhánh dry khi bypass. Gửi từ đây
+        // thay vì để content.js chép lại hằng số: L phụ thuộc sampleRate thật
+        // của thiết bị, và TP_DELAY là chi tiết nội bộ của bộ dò true-peak.
+        this.port.postMessage({ latencySamples: this.SL });
     }
 
     ensureChannels(nch) {

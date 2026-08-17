@@ -1,5 +1,5 @@
 // ============================================================================
-//  Smart LUFS Normalizer Pro — v4.8
+//  Smart LUFS Normalizer Pro — v4.9
 //  - AGC feed-forward có hiệu chuẩn vòng kín (chainOffsetDb)
 //  - Multiband auto-makeup: trung tính khi không nén, không còn EQ tilt cố định
 //  - Phantom Bass tự hiệu chuẩn theo tỉ lệ dB so với siêu trầm gốc
@@ -78,6 +78,22 @@
 //      chúng. LUFS_TC_* tái lập chính xác alpha đã hiệu chỉnh của bản 200ms.
 //   4. Giữ nhánh dự phòng AnalyserNode: hai worklet kia hỏng thì bỏ tính năng
 //      được, còn bộ đo hỏng thì AGC chết hẳn.
+//
+//  v4.9 — bốn chỗ nhỏ hơn, đều là "làm đúng ý đồ sẵn có":
+//   1. exciterAir là highshelf 12kHz: với +3dB danh nghĩa thì tại 12kHz mới
+//      được +1.50dB, phải tới 16kHz mới đạt +2.46dB — mà Opus/AAC của YouTube
+//      đã cắt gần sạch trên 16kHz, nên phần lớn độ nâng rơi vào nhiễu mã hoá.
+//      Hạ về 9kHz để độ nâng rơi vào chỗ còn tín hiệu.
+//   2. Nới rộng Side dựng bằng cách CỘNG SONG SONG nhánh HP300 vào nhánh HP40.
+//      Hai bộ lọc lệch điểm cắt thì lệch pha trong vùng chuyển: lệch tới
+//      -1.13dB so với ý đồ, và ở 100–200Hz nó CẮT phần Side đáng lẽ để phẳng.
+//      Ý đồ vốn là một highshelf — nay dựng đúng bằng highshelf nối tiếp.
+//   3. Nhánh dry (bypass) không bù trễ, lệch nhánh wet 8.1ms. Crossfade hai bản
+//      sao tương quan cao lệch 8.1ms => comb filter, hõm đầu ở 62Hz. Limiter
+//      nay tự báo độ trễ của nó về qua port và nhánh dry được bù đúng bằng đó.
+//   4. resetTrackState không xoá vocalAmount, mà TC của nó là ~7s: bài mới thừa
+//      hưởng tới 4.5dB EQ của bài cũ trong nhiều giây đầu. (phantomGainDb và
+//      hfGainDb thì cố ý KHÔNG reset — xem ghi chú tại chỗ.)
 // ============================================================================
 
 // --- 1. HẰNG SỐ ĐIỀU KHIỂN ---
@@ -268,7 +284,7 @@ let isInitializing = false;
 let currentUIMode = 'podcast';
 let isBypassed = false;
 
-let preInput, chainIn, dryGain, wetGain, outBus, agcGain, sumNode;
+let preInput, chainIn, dryGain, dryDelay, wetGain, outBus, agcGain, sumNode;
 let compLow, compMid, compHigh, gainLow, gainMid, gainHigh;
 let tubeSaturator;
 let exciterBass, mudRemoval, exciterAir, widthBoost, phantomGain, phantomGate;
@@ -495,7 +511,9 @@ function applyDeviceProfile() {
     subCut1.frequency.setTargetAtTime(d.subCutHz, t, tc);
     subCut2.frequency.setTargetAtTime(d.subCutHz, t, tc);
     sideMono.frequency.setTargetAtTime(d.sideMonoHz, t, tc);
-    rampParam(widthExtra.gain, d.widthExtra * intensity, t, tc);
+    // widthExtra nay là highshelf nên gain tính bằng dB, không phải hệ số cộng.
+    // g = 0 cho 20*log10(1) = 0dB, tức trung tính đúng như trước.
+    rampParam(widthExtra.gain, 20 * Math.log10(1 + d.widthExtra * intensity), t, tc);
 
     const xf = d.crossfeed * intensity;
     rampParam(xfGainL.gain, xf, t, tc);
@@ -730,9 +748,19 @@ async function initAudioGraph() {
     chainIn = audioCtx.createGain();
     preInput.connect(chainIn);
 
+    // Nhánh dry (dùng khi bypass) phải trễ bằng nhánh wet, nếu không lúc
+    // crossfade hai bản sao tương quan cao lệch nhau 8.1ms sẽ comb filter với
+    // hõm đầu tiên ở 62Hz — giữa dải, nghe rõ. Phần trễ CỐ ĐỊNH và biết chính
+    // xác là look-ahead của limiter; limiter tự báo về qua port. Phần còn lại
+    // (group delay của biquad, oversample của WaveShaper) phụ thuộc tần số nên
+    // không bù được bằng một DelayNode — nhưng nó nhỏ hơn hẳn.
+    dryDelay = audioCtx.createDelay(0.05);
+    dryDelay.delayTime.value = 0;
+    preInput.connect(dryDelay);
+
     dryGain = audioCtx.createGain();
     dryGain.gain.value = 0;
-    preInput.connect(dryGain);
+    dryDelay.connect(dryGain);
 
     // ---- MULTI-BAND: Linkwitz-Riley 24dB/oct ----
     const Q_BUTTER = Math.SQRT1_2;
@@ -924,8 +952,13 @@ async function initAudioGraph() {
     mudRemoval.type = 'peaking'; mudRemoval.frequency.value = 300;
     mudRemoval.Q.value = 1.0; mudRemoval.gain.value = 0;
 
+    // Highshelf 12kHz (bản cũ) giao rất ít độ nâng vào chỗ còn nội dung: với
+    // +3dB danh nghĩa, tại 12kHz mới được +1.50dB và phải tới 16kHz mới đạt
+    // +2.46dB — mà Opus/AAC của YouTube đã cắt gần sạch trên 16kHz, nên phần
+    // lớn độ nâng rơi vào nhiễu mã hoá. Hạ xuống 9kHz: +1.20dB ở 8kHz,
+    // +1.79dB ở 10kHz, +2.26dB ở 12kHz — nằm trong vùng thật sự có tín hiệu.
     exciterAir = audioCtx.createBiquadFilter();
-    exciterAir.type = 'highshelf'; exciterAir.frequency.value = 12000;
+    exciterAir.type = 'highshelf'; exciterAir.frequency.value = 9000;
     exciterAir.gain.value = 0;
 
     sumNode.connect(exciterBass);
@@ -1011,19 +1044,21 @@ async function initAudioGraph() {
     sideMono = lr('highpass', 40);          // tần số cắt đặt theo thiết bị
     vocalSideDuck.connect(sideMono);
 
-    const sideWideHp = lr('highpass', 300);
-    vocalSideDuck.connect(sideWideHp);
-    widthExtra = audioCtx.createGain();
-    widthExtra.gain.value = 0;              // 0 = rộng đúng như bản gốc
-    sideWideHp.connect(widthExtra);
-
-    const sideBus = audioCtx.createGain();
-    sideMono.connect(sideBus);
-    widthExtra.connect(sideBus);
+    // Ý đồ là: Side bằng 0 dưới sideMonoHz, x1 tới 300Hz, x(1+g) trên 300Hz —
+    // tức đúng một HIGHSHELF. Bản cũ dựng nó bằng cách CỘNG SONG SONG nhánh
+    // HP300 vào nhánh HP40, mà hai bộ lọc lệch điểm cắt thì lệch pha trong
+    // vùng chuyển: đo được lệch tới -1.13dB so với ý đồ ở g=0.5, và tệ hơn là
+    // ở 100–200Hz nó CẮT phần Side đáng lẽ để phẳng (-0.27..-0.41dB thay vì
+    // 0..+0.86dB). Nối tiếp một highshelf cho đúng ý đồ và bớt hai node.
+    widthExtra = audioCtx.createBiquadFilter();
+    widthExtra.type = 'highshelf';
+    widthExtra.frequency.value = 300;
+    widthExtra.gain.value = 0;              // 0dB = rộng đúng như bản gốc
+    sideMono.connect(widthExtra);
 
     widthBoost = audioCtx.createGain();
     widthBoost.gain.value = 1.0;
-    sideBus.connect(widthBoost);
+    widthExtra.connect(widthBoost);
 
     const merger = audioCtx.createChannelMerger(2);
     const invSide = audioCtx.createGain();
@@ -1092,7 +1127,12 @@ async function initAudioGraph() {
         limiterNode.parameters.get('ceiling').value = ceilingLin;
         limiterNode.parameters.get('release').value = 0.15;
         limiterNode.port.onmessage = (e) => {
-            if (e.data && typeof e.data.reductionDb === 'number') limiterReductionDb = e.data.reductionDb;
+            if (!e.data) return;
+            if (typeof e.data.reductionDb === 'number') limiterReductionDb = e.data.reductionDb;
+            if (typeof e.data.latencySamples === 'number') {
+                dryDelay.delayTime.value = e.data.latencySamples / audioCtx.sampleRate;
+                console.log(`↔️ Bù trễ nhánh dry: ${(e.data.latencySamples / audioCtx.sampleRate * 1000).toFixed(2)}ms`);
+            }
         };
         console.log(`🧱 Brickwall limiter: look-ahead ${LOOKAHEAD_MS}ms @ ${LIMIT_CEILING_DB} dBFS`);
     } else {
@@ -1174,7 +1214,20 @@ function resetTrackState() {
     limiterAvgDb = 0;
     tickCount = 0;
     isCorrecting = true;
-    // chainOffsetDb và makeupDb KHÔNG reset: đó là đặc tính của chain, không phải của bài
+
+    // Vocal focus PHẢI reset: nó là đặc tính của BẢN PHỐI, và TC ~7s nghĩa là
+    // bài mới thừa hưởng tới 4.5dB EQ của bài cũ trong nhiều giây đầu. Về 0 là
+    // về trung tính rồi mới bám lên, không bao giờ sai theo hướng quá tay.
+    vocalAmount = 0;
+    vocalRatioDb = null;
+    if (isInitialized) applyVocalGains(audioCtx.currentTime);
+
+    // phantomGainDb / hfGainDb thì KHÔNG reset: hai vòng đó có TC ~2s và bám
+    // theo mức nguồn ĐÃ đo, nên tự đúng lại rất nhanh. Ép về -40dB sẽ tạo ra
+    // một cú fade-in 2s của phần trầm ảo ở đầu mỗi bài — dễ nghe thấy hơn hẳn
+    // so với chỗ sai mà nó khắc phục.
+
+    // chainOffsetDb và makeupDb cũng KHÔNG reset: đó là đặc tính của chain
 }
 
 // Makeup bám theo mức nén trung bình dài hạn: giữ nguyên độ nén tức thời (density),
