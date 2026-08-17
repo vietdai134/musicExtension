@@ -29,6 +29,19 @@ class LoudnessProcessor extends AudioWorkletProcessor {
         this.filled = 0;
         this.acc = 0;      // tổng bình phương của đoạn đang gom
         this.count = 0;
+
+        // Chuyển bài: cửa sổ 400ms đang chứa audio của BÀI CŨ. Nếu không xả,
+        // block đầu tiên sau khi chuyển vẫn nói về bài cũ và AGC giữ nguyên độ
+        // lợi sai thêm 400ms nữa — đúng lúc tai đang bị tra tấn nhất.
+        this.port.onmessage = (e) => {
+            if (e.data && e.data.reset) {
+                this.slots.fill(0);
+                this.slot = 0;
+                this.filled = 0;
+                this.acc = 0;
+                this.count = 0;
+            }
+        };
     }
 
     process(inputs) {
@@ -59,12 +72,17 @@ class LoudnessProcessor extends AudioWorkletProcessor {
                 this.acc = 0;
                 this.count = 0;
 
-                if (this.filled === SLOTS) {
-                    let sum = 0;
-                    for (let k = 0; k < SLOTS; k++) sum += this.slots[k];
-                    // Chia cho SỐ MẪU MỖI KÊNH: sumL/n + sumR/n = (sumL+sumR)/n
-                    this.port.postMessage({ ms: sum / (SLOTS * this.hop) });
-                }
+                // Cửa sổ chưa đầy vẫn phát, nhưng đánh dấu partial. Chờ đủ 400ms
+                // nghĩa là 400ms đầu mỗi bài AGC hoàn toàn mù — mà đó chính là
+                // lúc nó cần biết nhất. Block partial đủ tốt để chặn cú vọt;
+                // main thread chỉ dùng nó cho momentary, KHÔNG đưa vào bộ tích
+                // phân (block ngắn hơn 400ms không phải block hợp lệ của BS.1770).
+                let sum = 0;
+                for (let k = 0; k < this.filled; k++) sum += this.slots[k];
+                this.port.postMessage({
+                    ms: sum / (this.filled * this.hop),
+                    partial: this.filled < SLOTS
+                });
             }
         }
 

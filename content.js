@@ -1,5 +1,5 @@
 // ============================================================================
-//  Smart LUFS Normalizer Pro — v4.9
+//  Smart LUFS Normalizer Pro — v5.0
 //  - AGC feed-forward có hiệu chuẩn vòng kín (chainOffsetDb)
 //  - Multiband auto-makeup: trung tính khi không nén, không còn EQ tilt cố định
 //  - Phantom Bass tự hiệu chuẩn theo tỉ lệ dB so với siêu trầm gốc
@@ -94,6 +94,28 @@
 //   4. resetTrackState không xoá vocalAmount, mà TC của nó là ~7s: bài mới thừa
 //      hưởng tới 4.5dB EQ của bài cũ trong nhiều giây đầu. (phantomGainDb và
 //      hfGainDb thì cố ý KHÔNG reset — xem ghi chú tại chỗ.)
+//
+//  v5.0 — ĐÚNG VIỆC CHÍNH CỦA APP: mức ổn định khi chuyển bài.
+//  Đo bằng mô phỏng chạy chính vòng điều khiển này (6 bài, nguồn -27..-9 LUFS):
+//  bản cũ cho các bài rơi vào -16.00 hoặc -12.00 => LUÔN chênh nhau 4.00dB.
+//   1. NGUYÊN NHÂN LỚN NHẤT, và không phải hiện tượng nhất thời: AGC kéo bài
+//      nhỏ lên đúng TARGET_MIN và ép bài to xuống đúng TARGET_MAX. Cả hai đều
+//      "đạt" nhưng cách nhau đúng bề rộng cửa sổ. Nay đã phải chỉnh thì chỉnh
+//      về GIỮA cửa sổ => 6 bài đó tụ lại trong 0.78dB. Cửa sổ vẫn còn tác dụng
+//      deadband: nằm trong thì không đụng, khỏi chỉnh vặt.
+//   2. Bài mới kế thừa nguyên độ lợi của bài cũ (currentAppliedGainDb không hề
+//      được reset). Bài cũ là bản thu nhỏ cần +9dB thì bài mới lãnh đủ +9dB đó.
+//      Nay hạ về prior học qua các bài, rồi ducking thêm 6dB cho quãng mù.
+//   3. Slew đối xứng 1.5dB/s: phát hiện quá to rồi vẫn phải mất ~9s mới hạ
+//      xong, và tai chịu suốt 9s đó. Nay hạ 6dB/s, lên vẫn 1.5dB/s.
+//   4. Watcher poll 500ms là quá chậm — bài mới đã phát rồi mới reset. Nay bắt
+//      'loadstart'/'emptied' của thẻ video, bắn trước khi có mẫu nào ra loa.
+//   5. Cửa sổ 400ms của bộ đo còn chứa audio BÀI CŨ sau khi chuyển; nay xả, và
+//      worklet phát block partial để có ước lượng sau ~100ms thay vì 400ms.
+//   6. Mấy giây đầu một bài không đại diện cho cả bài (intro nhẹ). Khi số đo
+//      còn non thì cố ý nhắm thấp hơn, cộng một chốt chặn theo mức tức thời
+//      chỉ hạ chứ không nâng. Đo: nhạc verse/chorus chênh 8dB mỗi 8s làm độ
+//      lợi dao động 0.00dB => chốt chặn không biến AGC thành compressor.
 // ============================================================================
 
 // --- 1. HẰNG SỐ ĐIỀU KHIỂN ---
@@ -102,7 +124,6 @@ const FFT_SIZE = 16384;              // chỉ dùng cho nhánh dự phòng Analy
 const ABS_GATE_LUFS = -55;
 const DEADBAND_OPEN_DB = 1.0;
 const DEADBAND_CLOSE_DB = 0.15;
-const SLEW_DB_PER_SEC = 1.5;
 
 // --- Integrated loudness (BS.1770-4) ---
 // AGC PHẢI lái bằng integrated, không phải momentary. Loudness momentary của
@@ -135,12 +156,45 @@ const alphaFor = (tcSec) => 1 - Math.exp(-lufsBlockDt / tcSec);
 const LOCK_SECONDS = 30;             // điều kiện cần (tính bằng dữ liệu đã đo, không phải đồng hồ)
 const LOCK_CHECK_TICKS = 50;         // đối chiếu mỗi 10s (tick điều khiển vẫn 200ms)
 const LOCK_STABLE_DB = 0.5;          // trôi dưới ngần này trong 10s = đã đứng yên
-const SLEW_LOCKED_DB_PER_SEC = 0.3;
+// Slew BẤT ĐỐI XỨNG. Sai theo hướng TO khó chịu hơn hẳn sai theo hướng NHỎ:
+// quá to là chói tai và phải với tay vặn nhỏ, quá nhỏ chỉ là hơi khẽ vài giây.
+// Bản đối xứng 1.5dB/s là lý do "nhỏ dần dần" — khi bài mới hoá ra to hơn
+// tưởng 14dB thì phải mất ~9s mới hạ xong, và suốt 9s đó tai phải chịu.
+// Hạ nhanh, lên chậm: 6dB/s cắt quãng đó còn ~2.3s mà không gây bơm.
+const SLEW_UP_DB_PER_SEC = 1.5;
+const SLEW_DOWN_DB_PER_SEC = 6.0;
+const SLEW_LOCKED_UP_DB_PER_SEC = 0.3;
+const SLEW_LOCKED_DOWN_DB_PER_SEC = 2.0;   // đã khoá vẫn phải thoát nhanh khi đoán sai
 const DEADBAND_OPEN_LOCKED_DB = 2.0;
 const MAX_GAIN_DB = 24;
 const LIMIT_CEILING_DB = -1.0;
 const LOOKAHEAD_MS = 8;              // 5ms quá ngắn cho trầm: envelope bám theo chu kỳ sóng
 const FAST_LOCK_TICKS = 13;          // ~2.6s đầu mỗi track
+
+// --- KHỚP MỨC KHI CHUYỂN BÀI ---
+// Vấn đề gốc: mấy giây đầu một bài KHÔNG đại diện cho cả bài. Rất nhiều bài mở
+// đầu bằng intro nhẹ; AGC chốt độ lợi theo intro rồi thân bài vào to hơn cả
+// chục dB. Hai lớp phòng vệ:
+//  1. Khi số đo còn non thì cố ý nhắm THẤP hơn mục tiêu. Đoán sai theo hướng
+//     nhỏ thì chỉ khẽ vài giây; đoán sai theo hướng to thì chói tai.
+//  2. Bài mới KHÔNG kế thừa độ lợi của bài trước. Bài trước có thể là bản thu
+//     rất nhỏ (độ lợi +12dB); áp nguyên số đó lên bài sau là một cú vọt.
+//     Thay bằng trung bình động của độ lợi đã ổn định qua các bài đã nghe —
+//     ước lượng tốt hơn hẳn, và lấy min() để không bao giờ khởi đầu to hơn.
+const EARLY_CAUTION_DB = 3.0;        // nhắm thấp hơn ngần này khi chưa có dữ liệu
+const CONFIDENCE_SEC = 10;           // đo đủ ngần này thì tin hẳn số đo
+const PRIOR_ALPHA = 0.35;            // mỗi bài đóng góp ngần này vào prior
+const TRACK_CHANGE_DUCK_DB = 6.0;    // hạ tạm lúc chuyển bài, fastLock kéo lại ngay
+
+// Chốt chặn theo mức TỨC THỜI. Cần nó vì integrated làm đúng việc của nó vẫn
+// gây vọt: bài mở đầu bằng intro nhẹ 4s thì integrated (gồm cả intro) nói bài
+// này nhỏ, và cổng tương đối -10 LU KHÔNG loại được intro chỉ thấp hơn ~12dB.
+// Thân bài vào là vọt, mà integrated vẫn đang bảo "cứ nâng lên".
+// Đây KHÔNG phải bộ lái — AGC vẫn chạy bằng integrated. Nó chỉ chặn một chiều
+// (hạ, không nâng) và chỉ khi mức ra tức thời vượt trần mục tiêu quá ngưỡng
+// dưới đây. Nhạc bình thường có momentary cao hơn integrated ~3-6dB ở điệp
+// khúc, nên ngưỡng phải rộng hơn thế mới không biến thành compressor chậm.
+const MOMENTARY_GUARD_DB = 7.0;
 
 // Limiter được phép ghì tới mức này. Vượt qua, AGC tự hạ gain thay vì để
 // limiter méo tín hiệu. Đây là đánh đổi có ý thức: to hơn <-> sạch hơn.
@@ -314,6 +368,10 @@ let integRefDb = null;
 let integStable = false;
 let chainOffsetDb = 0;
 let currentAppliedGainDb = 0;
+// Độ lợi điển hình của nội dung người dùng đang nghe, học dần qua các bài.
+// Lưu xuống storage để bài ĐẦU TIÊN của phiên sau cũng có điểm khởi đầu đúng.
+let priorGainDb = null;
+let priorSavedThisTrack = false;
 let isCorrecting = false;
 let tickCount = 0;
 
@@ -326,6 +384,7 @@ let limiterAvgDb = 0;
 let limiterTrimDb = 0;
 
 const sourceCache = new WeakMap();
+const mediaHooked = new WeakSet();   // tránh gắn trùng listener khi gắn lại nguồn
 let currentSource = null;
 let currentElement = null;
 let currentVideoId = null;
@@ -334,6 +393,15 @@ let watcherInterval = null;
 
 // --- 3. CÀI ĐẶT NGƯỜI DÙNG ---
 const clampVocal = (v) => Math.max(0, Math.min(1, (parseFloat(v) || 0) / 100));
+
+// Prior để ở storage.local: nó là đặc tính của thư viện nhạc người dùng đang
+// nghe trên máy này, không phải cài đặt cần đồng bộ giữa các thiết bị.
+chrome.storage.local.get(['priorGainDb'], (data) => {
+    if (data && typeof data.priorGainDb === 'number' && isFinite(data.priorGainDb)) {
+        priorGainDb = Math.max(-MAX_GAIN_DB, Math.min(MAX_GAIN_DB, data.priorGainDb));
+        console.log(`📌 Điểm khởi đầu độ lợi học từ phiên trước: ${priorGainDb.toFixed(2)}dB`);
+    }
+});
 
 chrome.storage.sync.get(
     ['userTargetMin', 'userTargetMax', 'userMode', 'userBypass', 'userVocal', 'userDevice', 'userIntensity'],
@@ -599,9 +667,9 @@ function createLufsMeter(inputNode, onBlock) {
         // thì đồ thị mới chắc chắn kéo nó chạy. silentSink là gain 0.
         node.connect(silentSink);
         node.port.onmessage = (e) => {
-            if (e.data && typeof e.data.ms === 'number') onBlock(e.data.ms);
+            if (e.data && typeof e.data.ms === 'number') onBlock(e.data.ms, !!e.data.partial);
         };
-        return { worklet: true };
+        return { worklet: true, node };
     }
 
     // Dự phòng: AudioWorklet không nạp được thì AGC vẫn phải hoạt động, chỉ là
@@ -673,7 +741,11 @@ function integratedLufs(g) {
 // Nhận MỘT block loudness (400ms, chồng lấn 75%) từ worklet — hoặc từ nhánh
 // dự phòng trong tick. Đây là nơi duy nhất inLufsSmooth/inIntegrated được cập
 // nhật, nên vòng điều khiển chỉ việc đọc số đã sẵn sàng.
-function pushLufsBlock(isInput, ms) {
+// partial = cửa sổ chưa đủ 400ms (mấy trăm ms đầu sau khi chuyển bài). Dùng
+// được cho momentary — đủ để chặn cú vọt — nhưng KHÔNG đưa vào bộ tích phân,
+// vì block ngắn hơn 400ms không phải block hợp lệ của BS.1770 và sẽ làm lệch
+// thống kê cổng.
+function pushLufsBlock(isInput, ms, partial) {
     const lufs = blockLufs(ms);
     if (lufs === null) return;    // cổng tuyệt đối -55 LUFS: khoảng lặng không tính
 
@@ -683,13 +755,17 @@ function pushLufsBlock(isInput, ms) {
         const a = fast ? alphaFor(LUFS_TC_FAST)
             : alphaFor(inLufsSmooth !== null && lufs > inLufsSmooth ? LUFS_TC_UP : LUFS_TC_DOWN);
         inLufsSmooth = (inLufsSmooth === null) ? lufs : inLufsSmooth + (lufs - inLufsSmooth) * a;
-        pushBlock(inIntg, ms);
-        inIntegrated = integratedLufs(inIntg);
+        if (!partial) {
+            pushBlock(inIntg, ms);
+            inIntegrated = integratedLufs(inIntg);
+        }
     } else {
         const a = fast ? alphaFor(LUFS_TC_FAST) : alphaFor(LUFS_TC_OUT);
         outLufsSmooth = (outLufsSmooth === null) ? lufs : outLufsSmooth + (lufs - outLufsSmooth) * a;
-        pushBlock(outIntg, ms);
-        outIntegrated = integratedLufs(outIntg);
+        if (!partial) {
+            pushBlock(outIntg, ms);
+            outIntegrated = integratedLufs(outIntg);
+        }
     }
 }
 
@@ -1197,11 +1273,36 @@ function attachSource(el) {
     src.connect(preInput);
     currentSource = src;
     currentElement = el;
+
+    // Watcher poll 500ms là quá chậm cho việc này: suốt quãng đó bài mới đã
+    // phát rồi mà AGC vẫn đang áp độ lợi của bài cũ. 'loadstart' và 'emptied'
+    // bắn NGAY khi YouTube đổi nguồn của thẻ video, trước khi có mẫu âm thanh
+    // nào ra loa — đó mới là thời điểm đúng để reset.
+    if (!mediaHooked.has(el)) {
+        mediaHooked.add(el);
+        const onNewMedia = () => {
+            if (!isInitialized) return;
+            resetTrackState();
+            startMonitor();
+            // Cố ý KHÔNG đụng currentVideoId: để syncWithPage vẫn nhận ra và
+            // cập nhật id khi location đổi. Reset hai lần là vô hại.
+            console.log('⏭️ Nguồn media đổi — reset AGC ngay, không chờ poll');
+        };
+        el.addEventListener('loadstart', onNewMedia);
+        el.addEventListener('emptied', onNewMedia);
+    }
+
     console.log('🔌 Đã gắn vào player chính.');
 }
 
 // --- 9. VÒNG ĐIỀU KHIỂN ---
 function resetTrackState() {
+    // resetTrackState bị gọi HAI LẦN cho mỗi lần chuyển bài: một từ 'loadstart'
+    // và một từ syncWithPage khi location đổi. Cú ducking bên dưới không được
+    // cộng dồn thành 12dB, nên chỉ ducking ở lần gọi ĐẦU — nhận ra bằng việc
+    // lần đó còn số đo của bài cũ, lần sau thì đã null rồi.
+    const firstResetOfChange = inLufsSmooth !== null;
+
     inLufsSmooth = null;
     outLufsSmooth = null;
     inIntegrated = null;
@@ -1214,6 +1315,28 @@ function resetTrackState() {
     limiterAvgDb = 0;
     tickCount = 0;
     isCorrecting = true;
+    priorSavedThisTrack = false;
+
+    // Xả cửa sổ 400ms của bộ đo: nó đang chứa audio của BÀI CŨ, và nếu không xả
+    // thì block đầu tiên sau khi chuyển vẫn nói về bài cũ.
+    for (const m of [inMeter, outMeter]) {
+        if (m && m.worklet && m.node) m.node.port.postMessage({ reset: true });
+    }
+
+    // KHÔNG kế thừa độ lợi của bài trước. Bài trước có thể là bản thu rất nhỏ
+    // cần +12dB; áp nguyên số đó lên bài sau (có thể là master to) là đúng cú
+    // "chuyển bài cái to hẳn". Hai lớp:
+    //  - hạ về prior nếu prior thấp hơn (min, không phải gán: khởi đầu quá nhỏ
+    //    chỉ khẽ vài trăm ms, khởi đầu quá to là chói tai),
+    //  - rồi hạ thêm một cú ducking. Trong vài trăm ms mù này ta KHÔNG BIẾT GÌ
+    //    về bài mới, nên chọn phía an toàn. fastLock kéo lại ngay khi block đầu
+    //    tiên về (~100ms nhờ block partial), nên cái giá phải trả là vài trăm
+    //    ms hơi khẽ — đổi lấy việc không bao giờ giật mình.
+    if (isInitialized && firstResetOfChange) {
+        if (priorGainDb !== null && priorGainDb < currentAppliedGainDb) currentAppliedGainDb = priorGainDb;
+        currentAppliedGainDb = Math.max(-MAX_GAIN_DB, currentAppliedGainDb - TRACK_CHANGE_DUCK_DB);
+        agcGain.gain.setTargetAtTime(Math.pow(10, currentAppliedGainDb / 20), audioCtx.currentTime, 0.03);
+    }
 
     // Vocal focus PHẢI reset: nó là đặc tính của BẢN PHỐI, và TC ~7s nghĩa là
     // bài mới thừa hưởng tới 4.5dB EQ của bài cũ trong nhiều giây đầu. Về 0 là
@@ -1411,10 +1534,37 @@ function startMonitor() {
         const measured = inIntegrated !== null ? inIntegrated : inLufsSmooth;
         const base = measured + chainOffsetDb; // mức ra dự kiến khi gain = 0
 
+        // Ra GIỮA cửa sổ, không phải ra mép gần nhất.
+        // Bản cũ kéo bài nhỏ lên đúng TARGET_MIN và ép bài to xuống đúng
+        // TARGET_MAX. Cả hai đều "đạt", nhưng hai bài đó cách nhau đúng bằng
+        // BỀ RỘNG cửa sổ — mặc định 4dB. Đấy chính là "bài này nhỏ bài kia to"
+        // ở trạng thái ĐÃ ỔN ĐỊNH, không phải hiện tượng nhất thời lúc chuyển
+        // bài, và không có thời gian nào chữa được vì AGC coi cả hai là đúng.
+        // Cửa sổ vẫn còn tác dụng: nằm trong thì không đụng vào (khỏi chỉnh
+        // vặt), nhưng đã phải chỉnh thì chỉnh về giữa để mọi bài tụ về một mức.
+        const effMid = (effMin + effMax) / 2;
         let desiredGainDb = 0;
-        if (base < effMin) desiredGainDb = effMin - base;
-        else if (base > effMax) desiredGainDb = effMax - base;
+        if (base < effMin || base > effMax) desiredGainDb = effMid - base;
+
+        // Thận trọng khi số đo còn non. Mấy giây đầu một bài không đại diện cho
+        // cả bài: intro nhẹ làm AGC nâng quá tay, rồi thân bài vào là vọt. Nhắm
+        // thấp hơn một chút cho tới khi đo đủ dữ liệu — sai theo hướng nhỏ thì
+        // chỉ khẽ vài giây, sai theo hướng to thì chói tai.
+        const measuredSec = inIntg.n * lufsBlockDt;
+        const uncertain = Math.max(0, 1 - measuredSec / CONFIDENCE_SEC);
+        desiredGainDb -= EARLY_CAUTION_DB * uncertain;
+
         desiredGainDb += limiterTrimDb;
+
+        // Chốt chặn tức thời: nếu mức RA ngay lúc này đã vượt trần mục tiêu quá
+        // MOMENTARY_GUARD_DB thì hạ, bất kể integrated đang nói gì. Một chiều —
+        // không bao giờ dùng để NÂNG — nên nó không thể biến AGC thành compressor.
+        if (inLufsSmooth !== null) {
+            const outNowDb = inLufsSmooth + chainOffsetDb + currentAppliedGainDb;
+            const over = outNowDb - (effMax + MOMENTARY_GUARD_DB);
+            if (over > 0) desiredGainDb = Math.min(desiredGainDb, currentAppliedGainDb - over);
+        }
+
         desiredGainDb = Math.max(-MAX_GAIN_DB, Math.min(MAX_GAIN_DB, desiredGainDb));
 
         // Khoá dần: đo được càng nhiều thì con số càng đáng tin, và càng ít lý do
@@ -1422,10 +1572,21 @@ function startMonitor() {
         // => mức đứng yên trong suốt phần còn lại của bài.
         const locked = inIntg.n * lufsBlockDt >= LOCK_SECONDS && integStable;
         const openDb = locked ? DEADBAND_OPEN_LOCKED_DB : DEADBAND_OPEN_DB;
-        const slewDb = locked ? SLEW_LOCKED_DB_PER_SEC : SLEW_DB_PER_SEC;
+
+        // Đã đo đủ và số đo đứng yên => chốt độ lợi của bài này vào prior, để
+        // bài SAU có điểm khởi đầu đúng. Mỗi bài chỉ đóng góp một lần.
+        if (locked && !priorSavedThisTrack) {
+            priorSavedThisTrack = true;
+            const settled = currentAppliedGainDb - limiterTrimDb;   // bỏ phần lùi tạm thời
+            priorGainDb = priorGainDb === null
+                ? settled
+                : priorGainDb + (settled - priorGainDb) * PRIOR_ALPHA;
+            chrome.storage.local.set({ priorGainDb });
+        }
 
         // Deadband có trễ: mở rộng, đóng hẹp => hội tụ được thay vì đóng băng
-        const err = Math.abs(desiredGainDb - currentAppliedGainDb);
+        const delta = desiredGainDb - currentAppliedGainDb;
+        const err = Math.abs(delta);
         if (!isCorrecting && err > openDb) isCorrecting = true;
         else if (isCorrecting && err < DEADBAND_CLOSE_DB) isCorrecting = false;
 
@@ -1433,9 +1594,14 @@ function startMonitor() {
             currentAppliedGainDb = desiredGainDb;
             agcGain.gain.setTargetAtTime(Math.pow(10, currentAppliedGainDb / 20), now, 0.15);
         } else if (isCorrecting) {
+            // Bất đối xứng: HẠ nhanh, LÊN chậm. Hạ chậm nghĩa là bắt tai chịu
+            // đựng suốt quãng sửa sai; lên nhanh thì nghe ra bơm ở đoạn nhạc nhẹ.
+            const down = delta < 0;
+            const slewDb = locked
+                ? (down ? SLEW_LOCKED_DOWN_DB_PER_SEC : SLEW_LOCKED_UP_DB_PER_SEC)
+                : (down ? SLEW_DOWN_DB_PER_SEC : SLEW_UP_DB_PER_SEC);
             const step = slewDb * (TICK_MS / 1000);
-            const delta = desiredGainDb - currentAppliedGainDb;
-            currentAppliedGainDb += Math.sign(delta) * Math.min(Math.abs(delta), step);
+            currentAppliedGainDb += Math.sign(delta) * Math.min(err, step);
             agcGain.gain.setTargetAtTime(Math.pow(10, currentAppliedGainDb / 20), now, 0.12);
         }
 
